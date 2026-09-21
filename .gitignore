@@ -1,0 +1,18 @@
+# Secrets
+.env
+token.json
+*_credentials.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.hypothesis/
+
+# IDE / OS
+.vscode/
+.idea/
+.kiro/
+.DS_Store
+Thumbs.db
