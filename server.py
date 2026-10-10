@@ -1,9 +1,12 @@
 """
-Warehouse Recommendationommendation — FastAPI backend
-Serves a single HTML page and two JSON API endpoints.
+LOC Recommendation — FastAPI backend v2
+Scan BT (BT{rec_Id}) or GT (GT…) → auto-resolve SKU → putaway decision.
+No separate UPC scan step needed.
+
 Run: uvicorn server:app --host 0.0.0.0 --port 8504
 """
 
+import math
 import os
 from datetime import date
 from pathlib import Path
@@ -40,6 +43,13 @@ app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"])
 
 # ---------------------------------------------------------------------------
+# Putaway config (mirrors NJ Allocation v4 config.py)
+# ---------------------------------------------------------------------------
+PUTAWAY_CFG = {
+    "putaway_d2s": 30,   # MIDDLE: FC D2S > this → new goods to SFC
+}
+
+# ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
 def _strip_i18n(val):
@@ -49,120 +59,299 @@ def _strip_i18n(val):
     return val or ""
 
 
-def lookup_sku_from_upc(raw: str):
-    sql = text("""
-        SELECT u.item_number,
-               g.goods_name,
-               COALESCE(NULLIF(g.goods_ename,''), g.goods_name) AS goods_en_name
-        FROM yamibuy_im.im_item_upc u
-        JOIN yamibuy_im.im_item i        ON i.item_number = u.item_number
-        JOIN yamibuy_master.xysc_goods g ON g.goods_id    = i.goods_id
-        WHERE u.upc = :v OR u.item_number = :v
-        LIMIT 1
-    """)
+_BATCH_SELECT = """
+    SELECT b.rec_Id,
+           CONCAT('BT', b.rec_Id)                             AS batch_number,
+           b.group_batch_id,
+           b.inbound_number,
+           b.item_number,
+           b.quantity,
+           b.qc_ExpiredDate                                   AS exp_dtm,
+           CASE WHEN b.qc_ExpiredDate > 0
+                THEN DATE(FROM_UNIXTIME(b.qc_ExpiredDate))
+                ELSE NULL END                                 AS exp_date,
+           CONVERT_TZ(FROM_UNIXTIME(b.in_dtm),
+                      'UTC','America/New_York')               AS recv_time_edt,
+           b.in_user                                         AS receiver,
+           COALESCE(NULLIF(g.goods_ename,''), g.goods_name)  AS goods_en_name,
+           g.goods_name
+    FROM yamibuy_wh.wh_inbound_batch b
+    LEFT JOIN yamibuy_im.im_item i   ON i.item_number = b.item_number
+    LEFT JOIN yamibuy_master.xysc_goods g ON g.goods_id = i.goods_id
+"""
+
+def lookup_by_bt(bt_str: str):
+    """BT{rec_Id} → single row."""
+    rec_id = int(bt_str[2:])
+    sql = text(_BATCH_SELECT + "WHERE b.rec_Id = :rid LIMIT 1")
     with engine.connect() as c:
-        df = pd.read_sql(sql, c, params={"v": raw.strip()})
-    if df.empty:
-        return None
-    return {
-        "item_number":   str(df.iloc[0]["item_number"]),
-        "goods_name":    _strip_i18n(str(df.iloc[0]["goods_name"])),
-        "goods_en_name": _strip_i18n(str(df.iloc[0]["goods_en_name"])),
+        df = pd.read_sql(sql, c, params={"rid": rec_id})
+    return None if df.empty else df.iloc[0]
+
+
+def lookup_by_gt(gt_str: str):
+    """GT… → single row."""
+    sql = text(_BATCH_SELECT + "WHERE b.group_batch_id = :gt LIMIT 1")
+    with engine.connect() as c:
+        df = pd.read_sql(sql, c, params={"gt": gt_str})
+    return None if df.empty else df.iloc[0]
+
+
+def query_sku_inventory(sku: str, wh: str = "002") -> dict:
+    """
+    Fetch live inventory + segment data for putaway decision.
+    Returns: seg, fc_d2s, sfc_qty, fc_min_exp_date, need_minimal_exp
+    """
+    result = {
+        "seg": None, "fc_d2s": None, "sfc_qty": 0.0,
+        "fc_min_exp_date": None, "need_minimal_exp": 0,
     }
 
+    # FC qty, SFC qty, FC oldest expiry
+    try:
+        sql_inv = text("""
+            SELECT
+              SUM(CASE WHEN sl.zone_id=1 AND sl.location_type IN (3,4)
+                       THEN inv.quantity ELSE 0 END)           AS fc_qty,
+              SUM(CASE WHEN sl.zone_id=2
+                       THEN inv.quantity ELSE 0 END)           AS sfc_qty,
+              MIN(CASE WHEN sl.zone_id=1 AND sl.location_type IN (3,4)
+                            AND COALESCE(sli.expire_dtm, sl.expire_dtm) > 0
+                       THEN COALESCE(sli.expire_dtm, sl.expire_dtm)
+                       ELSE NULL END)                          AS fc_min_exp_dtm
+            FROM yamibuy_wh.wh_inventory_transaction inv
+            JOIN yamibuy_wh.wh_storage_location sl
+              ON inv.location_no=sl.location_no
+             AND inv.warehouse_number=sl.warehouse_number
+            LEFT JOIN yamibuy_wh.wh_storage_location_item sli
+              ON sl.location_no=sli.location_no
+             AND sl.warehouse_number=sli.warehouse_number
+             AND sli.item_number=inv.item_number
+            WHERE inv.warehouse_number=:wh
+              AND inv.item_number=:sku
+              AND inv.quantity>0
+        """)
+        with engine.connect() as c:
+            df_inv = pd.read_sql(sql_inv, c, params={"wh": wh, "sku": sku})
+        if not df_inv.empty:
+            result["sfc_qty"] = float(df_inv.iloc[0]["sfc_qty"] or 0)
+            fc_qty = float(df_inv.iloc[0]["fc_qty"] or 0)
+            min_exp = df_inv.iloc[0]["fc_min_exp_dtm"]
+            if min_exp and int(min_exp) > 0:
+                result["fc_min_exp_date"] = date.fromtimestamp(int(min_exp)).isoformat()
+                result["need_minimal_exp"] = 1
+        else:
+            fc_qty = 0.0
+    except Exception:
+        fc_qty = 0.0
 
-def lookup_batch(bt: str, sku: str):
-    sql = text("""
-        SELECT rec_Id,
-               CONCAT('BT', rec_Id) AS batch_number,
-               item_number, quantity,
-               qc_ExpiredDate AS exp_dtm,
-               CASE WHEN qc_ExpiredDate > 0
-                     THEN DATE(FROM_UNIXTIME(qc_ExpiredDate))
-                    ELSE NULL END AS exp_date,
-               CONVERT_TZ(FROM_UNIXTIME(in_dtm),'UTC','America/New_York') AS recv_time_edt,
-               in_user AS receiver
-        FROM yamibuy_wh.wh_inbound_batch
-        WHERE rec_Id      = CAST(SUBSTRING(:bt, 3) AS UNSIGNED)
-          AND item_number = :sku
-    """)
-    with engine.connect() as c:
-        df = pd.read_sql(sql, c, params={"bt": bt.strip(), "sku": sku.strip()})
-    if df.empty:
-        return None
-    row = df.iloc[0]
-    return {
-        "batch_number": str(row["batch_number"]),
-        "item_number":  str(row["item_number"]),
-        "quantity":     int(row["quantity"]),
-        "exp_date":     str(row["exp_date"]) if row["exp_date"] else None,
-        "exp_dtm":      int(row["exp_dtm"]) if row["exp_dtm"] else 0,
-        "recv_time":    str(row["recv_time_edt"])[:16] if row["recv_time_edt"] else None,
-        "receiver":     str(row["receiver"]),
-    }
+    # Sales data for segment + D2S
+    try:
+        sql_seg = text("""
+            SELECT
+              COALESCE(SUM(od.quantity),0)        AS qty_30,
+              COUNT(DISTINCT od.order_id)         AS order_lines_30,
+              COUNT(DISTINCT CASE WHEN od.created_at >= UNIX_TIMESTAMP(NOW()-INTERVAL 90 DAY)
+                                  THEN DATE(FROM_UNIXTIME(od.created_at)) END) AS active_days_90
+            FROM yamibuy_order.oc_order_detail od
+            JOIN yamibuy_order.oc_order o ON o.order_id=od.order_id
+            WHERE od.item_number=:sku
+              AND od.created_at >= UNIX_TIMESTAMP(NOW()-INTERVAL 30 DAY)
+              AND o.order_status NOT IN (7,8)
+        """)
+        with engine.connect() as c:
+            df_seg = pd.read_sql(sql_seg, c, params={"sku": sku})
 
+        if not df_seg.empty:
+            qty_30      = float(df_seg.iloc[0]["qty_30"] or 0)
+            order_lines = int(df_seg.iloc[0]["order_lines_30"] or 0)
+            active_days = int(df_seg.iloc[0]["active_days_90"] or 0)
+            avg_daily   = qty_30 / 30.0
 
-def query_zone1_worst_exp(sku: str, wh: str = "002"):
-    sql = text("""
-        SELECT MIN(IF(sli.rec_id IS NULL, sl.expire_dtm, sli.expire_dtm)) AS v
-        FROM yamibuy_wh.wh_inventory_transaction inv
-        JOIN yamibuy_wh.wh_storage_location sl
-            ON inv.location_no = sl.location_no
-           AND inv.warehouse_number = sl.warehouse_number
-        LEFT JOIN yamibuy_wh.wh_storage_location_item sli
-            ON sl.location_no = sli.location_no
-           AND sl.warehouse_number = sli.warehouse_number
-           AND sli.item_number = inv.item_number
-        WHERE inv.warehouse_number = :wh
-          AND inv.item_number = :sku
-          AND inv.quantity > 0
-          AND sl.zone_id = 1
-          AND sl.location_type IN (3,4)
-          AND IF(sli.rec_id IS NULL, sl.expire_dtm, sli.expire_dtm) > 0
-    """)
-    with engine.connect() as c:
-        df = pd.read_sql(sql, c, params={"wh": wh, "sku": sku})
-    val = df.iloc[0]["v"] if not df.empty else None
-    return date.fromtimestamp(int(val)).isoformat() if val else None
+            if active_days >= 21 and order_lines >= 30:
+                seg = "TOP"
+            elif order_lines < 8:
+                seg = "TAIL"
+            else:
+                seg = "MIDDLE"
+
+            result["seg"] = seg
+
+            if avg_daily > 0 and fc_qty > 0:
+                result["fc_d2s"] = round(fc_qty / avg_daily, 1)
+    except Exception:
+        pass
+
+    return result
 
 
 # ---------------------------------------------------------------------------
-# API endpoints
+# Putaway decision engine (mirrors logic/putaway.py decide_putaway)
+# ---------------------------------------------------------------------------
+def _sf(v, d=0.0):
+    try:
+        f = float(v)
+        return d if math.isnan(f) else f
+    except Exception:
+        return d
+
+
+def decide_putaway(seg, fc_d2s, sfc_qty, need_exp, new_exp_date,
+                   fc_min_exp_date, cfg) -> dict:
+    putaway_d2s = cfg.get("putaway_d2s", 30)
+    fc_d2s  = _sf(fc_d2s)
+    sfc_qty = _sf(sfc_qty)
+
+    if seg == "TBD":
+        return {"dest": "Receiving Zone", "rule": "TBD_KEEP",
+                "reason": "New product (<30d in stock) — hold at receiving zone until classified",
+                "color": "yellow"}
+
+    if seg == "TOP":
+        return {"dest": "FC", "rule": "TOP_FC",
+                "reason": "TOP SKU — always stock in FC", "color": "red"}
+
+    if seg in ("TAIL", "BOTTOM"):
+        return {"dest": "SFC", "rule": "TAIL_SFC",
+                "reason": "TAIL SKU — always stock in SFC", "color": "green"}
+
+    # MIDDLE
+    if (need_exp == 1 and new_exp_date and fc_min_exp_date
+            and new_exp_date < fc_min_exp_date):
+        return {"dest": "FC", "rule": "MID_EXP_EARLIER_FC",
+                "reason": f"New goods expire earlier than FC stock ({new_exp_date} < {fc_min_exp_date}) — FC first (FEFO)",
+                "color": "red"}
+
+    if fc_d2s > putaway_d2s:
+        return {"dest": "SFC", "rule": "MID_FC_D2S_HIGH",
+                "reason": f"FC has sufficient stock (D2S {fc_d2s:.0f} > {putaway_d2s}d) — put new goods in SFC",
+                "color": "green"}
+
+    if sfc_qty > 0:
+        return {"dest": "SFC", "rule": "MID_SFC_HAS_STOCK",
+                "reason": f"FC needs replenishment but SFC has stock ({sfc_qty:.0f} units) — put in SFC, wait for T2",
+                "color": "green"}
+
+    return {"dest": "FC", "rule": "MID_SFC_EMPTY",
+            "reason": "FC needs replenishment and SFC is empty — put directly in FC",
+            "color": "red"}
+
+
+# ---------------------------------------------------------------------------
+# API — new single-scan endpoint
+# ---------------------------------------------------------------------------
+@app.get("/api/scan_id")
+async def scan_id(id: str, lang: str = "en"):
+    """
+    Scan BT{rec_Id} or GT{…} — resolves SKU automatically.
+    Returns batch info + inventory context + putaway decision.
+    """
+    raw = id.strip().upper()
+    try:
+        if raw.startswith("BT") and raw[2:].isdigit():
+            row = lookup_by_bt(raw)
+        elif raw.startswith("GT"):
+            row = lookup_by_gt(raw)
+        else:
+            return JSONResponse({"error": "invalid_id",
+                                 "msg": "Must start with BT or GT"})
+
+        if row is None:
+            return JSONResponse({"error": "not_found"})
+
+        sku      = str(row["item_number"])
+        exp_date = str(row["exp_date"]) if row.get("exp_date") else None
+        gt       = str(row.get("group_batch_id") or "")
+
+        product = (_strip_i18n(str(row.get("goods_name", "") or ""))
+                   if lang == "zh"
+                   else _strip_i18n(str(row.get("goods_en_name", "") or "")))
+        if not product:
+            product = _strip_i18n(str(row.get("goods_name", "") or ""))
+
+        inv = query_sku_inventory(sku)
+
+        rec = decide_putaway(
+            seg            = inv["seg"],
+            fc_d2s         = inv["fc_d2s"],
+            sfc_qty        = inv["sfc_qty"],
+            need_exp       = inv["need_minimal_exp"],
+            new_exp_date   = exp_date,
+            fc_min_exp_date= inv["fc_min_exp_date"],
+            cfg            = PUTAWAY_CFG,
+        ) if inv["seg"] else {
+            "dest": "SFC", "rule": "NO_SEG",
+            "reason": "No segment data — defaulting to SFC", "color": "green"
+        }
+
+        return JSONResponse({
+            "batch_number": str(row["batch_number"]),
+            "group_batch_id": gt,
+            "item_number":  sku,
+            "quantity":     int(row["quantity"]),
+            "product":      product,
+            "exp_date":     exp_date,
+            "recv_time":    str(row["recv_time_edt"])[:16] if row.get("recv_time_edt") else None,
+            "receiver":     str(row.get("receiver") or ""),
+            "seg":          inv["seg"] or "—",
+            "fc_d2s":       inv["fc_d2s"],
+            "sfc_qty":      inv["sfc_qty"],
+            "rec":          rec,
+        })
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# API — legacy UPC endpoint (kept for backwards compatibility)
 # ---------------------------------------------------------------------------
 @app.get("/api/scan")
 async def scan(bt: str, upc: str, lang: str = "en"):
     try:
-        item = lookup_sku_from_upc(upc)
-        if item is None:
+        # resolve UPC → SKU
+        sql_upc = text("""
+            SELECT u.item_number,
+                   g.goods_name,
+                   COALESCE(NULLIF(g.goods_ename,''), g.goods_name) AS goods_en_name
+            FROM yamibuy_im.im_item_upc u
+            JOIN yamibuy_im.im_item i        ON i.item_number = u.item_number
+            JOIN yamibuy_master.xysc_goods g ON g.goods_id    = i.goods_id
+            WHERE u.upc = :v OR u.item_number = :v
+            LIMIT 1
+        """)
+        with engine.connect() as c:
+            df = pd.read_sql(sql_upc, c, params={"v": upc.strip()})
+        if df.empty:
             return JSONResponse({"error": "upc_not_found"})
+        item_number = str(df.iloc[0]["item_number"])
 
-        batch = lookup_batch(bt, item["item_number"])
-        if batch is None:
+        row = lookup_by_bt(bt.strip().upper())
+        if row is None or str(row["item_number"]) != item_number:
             return JSONResponse({"error": "not_found"})
 
-        # product name by language
-        batch["product"] = item["goods_name"] if lang == "zh" else item["goods_en_name"]
+        exp_date = str(row["exp_date"]) if row.get("exp_date") else None
+        inv = query_sku_inventory(item_number)
+        rec = decide_putaway(
+            seg=inv["seg"], fc_d2s=inv["fc_d2s"], sfc_qty=inv["sfc_qty"],
+            need_exp=inv["need_minimal_exp"], new_exp_date=exp_date,
+            fc_min_exp_date=inv["fc_min_exp_date"], cfg=PUTAWAY_CFG,
+        ) if inv["seg"] else {"dest": "SFC", "rule": "NO_SEG",
+                              "reason": "No segment data", "color": "green"}
 
-        # zone recommendation
-        rec = {"dest": "SFC", "reason": ""}
-        if not batch["exp_dtm"] or batch["exp_dtm"] <= 0:
-            rec = {"dest": "SFC", "reason": "No expiry date"}
-        else:
-            try:
-                z1 = query_zone1_worst_exp(item["item_number"])
-                inc = batch["exp_date"]
-                if z1 is None:
-                    rec = {"dest": "SFC", "reason": "No Zone 1 stock"}
-                elif z1 < inc:
-                    rec = {"dest": "NJFC", "reason": f"Zone 1 exp {z1} < this batch {inc}"}
-                else:
-                    rec = {"dest": "SFC",  "reason": f"Zone 1 exp {z1} ≥ this batch {inc}"}
-            except Exception as e:
-                rec = {"dest": "SFC", "reason": f"Zone query error: {e}"}
-
-        batch["rec"] = rec
-        return JSONResponse(batch)
-
+        product = (_strip_i18n(str(df.iloc[0]["goods_name"] or "")) if lang == "zh"
+                   else _strip_i18n(str(df.iloc[0]["goods_en_name"] or "")))
+        return JSONResponse({
+            "batch_number": str(row["batch_number"]),
+            "item_number":  item_number,
+            "quantity":     int(row["quantity"]),
+            "product":      product,
+            "exp_date":     exp_date,
+            "exp_dtm":      int(row.get("exp_dtm") or 0),
+            "recv_time":    str(row["recv_time_edt"])[:16] if row.get("recv_time_edt") else None,
+            "receiver":     str(row.get("receiver") or ""),
+            "rec":          rec,
+        })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -181,14 +370,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<title>Warehouse Recommendation</title>
+<title>Putaway Guide</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   background: #f5f5f5;
-  height: 100dvh;          /* dynamic viewport height — shrinks with keyboard */
+  height: 100dvh;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -217,15 +406,14 @@ body {
 /* ── Scan area ── */
 #scan-area {
   background: #fff;
-  padding: 10px 14px 6px;
+  padding: 10px 14px 8px;
   border-bottom: 1px solid #e5e5e5;
   flex-shrink: 0;
 }
-.field-row { margin-bottom: 8px; }
 .field-label {
   font-size: 0.7rem;
   color: #888;
-  margin-bottom: 2px;
+  margin-bottom: 4px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -239,17 +427,11 @@ input[type=text] {
   background: #fafafa;
   transition: border-color 0.15s;
 }
-input[type=text]:focus { border-color: #1a73e8; background: #fff; }
-input[type=text].confirmed { border-color: #34a853; background: #f6fbf7; }
-input[type=text]:disabled { color: #aaa; background: #f0f0f0; }
-.batch-tag {
-  font-size: 0.72rem;
-  color: #34a853;
-  margin-top: 2px;
-  height: 14px;
-}
+input[type=text]:focus  { border-color: #1a73e8; background: #fff; }
+input[type=text].ok     { border-color: #34a853; background: #f6fbf7; }
+input[type=text].err    { border-color: #ea4335; background: #fef7f7; }
 
-/* ── Result area — scrollable, fills remaining height ── */
+/* ── Result ── */
 #result-area {
   flex: 1;
   overflow-y: auto;
@@ -257,47 +439,57 @@ input[type=text]:disabled { color: #aaa; background: #f0f0f0; }
   -webkit-overflow-scrolling: touch;
 }
 
-/* Info card */
 .info-card {
   background: #e8f0fe;
   border-radius: 8px;
   padding: 10px 12px;
   font-size: 0.82rem;
-  line-height: 1.7;
+  line-height: 1.8;
   margin-bottom: 8px;
 }
 .info-card b { color: #333; }
+.tag {
+  display: inline-block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 10px;
+  margin-left: 4px;
+  vertical-align: middle;
+}
+.tag-top  { background:#fde8e8; color:#c0392b; }
+.tag-mid  { background:#fff3cd; color:#856404; }
+.tag-tail { background:#e8f0fe; color:#1a5276; }
+.tag-tbd  { background:#f3e5f5; color:#6a1b9a; }
 
-/* Recommendation banner */
 .rec-banner {
   border-radius: 10px;
   padding: 16px;
   text-align: center;
   margin-bottom: 8px;
 }
-.rec-banner.sfc   { background: #e8f5e9; border: 2px solid #34a853; }
-.rec-banner.njfc  { background: #fde8e8; border: 2px solid #ea4335; }
+.rec-banner.green  { background:#e8f5e9; border:2px solid #34a853; }
+.rec-banner.red    { background:#fde8e8; border:2px solid #ea4335; }
+.rec-banner.yellow { background:#fff8e1; border:2px solid #f0a500; }
 .rec-dest {
   font-size: 1.8rem;
   font-weight: 800;
   letter-spacing: 1px;
 }
-.rec-banner.sfc  .rec-dest { color: #34a853; }
-.rec-banner.njfc .rec-dest { color: #ea4335; }
-.rec-reason { font-size: 0.75rem; color: #666; margin-top: 4px; }
+.rec-banner.green  .rec-dest { color: #34a853; }
+.rec-banner.red    .rec-dest { color: #ea4335; }
+.rec-banner.yellow .rec-dest { color: #f0a500; }
+.rec-rule   { font-size: 0.72rem; font-weight: 700; color: #555; margin-top: 4px; }
+.rec-reason { font-size: 0.72rem; color: #666; margin-top: 2px; }
 
-/* Error */
 .error-msg { color: #ea4335; font-size: 0.85rem; padding: 8px 0; }
-
-/* Spinner */
-.spinner { text-align: center; color: #888; padding: 20px; font-size: 0.9rem; }
+.spinner   { text-align:center; color:#888; padding:20px; font-size:0.9rem; }
 </style>
 </head>
 <body>
 
-<!-- Header -->
 <div id="header">
-  <span class="title">📦 <span id="app-title">Warehouse Recommendation</span></span>
+  <span class="title">📦 <span id="app-title">Putaway Guide</span></span>
   <select id="lang-sel" onchange="setLang(this.value)">
     <option value="en">EN</option>
     <option value="es">ES</option>
@@ -305,197 +497,162 @@ input[type=text]:disabled { color: #aaa; background: #f0f0f0; }
   </select>
 </div>
 
-<!-- Scan inputs -->
 <div id="scan-area">
-  <div class="field-row">
-    <div class="field-label" id="lbl-batch">Batch Number</div>
-    <input type="text" id="bt-input" placeholder="Scan batch barcode…" autocomplete="off"
-           autocorrect="off" autocapitalize="off" spellcheck="false">
-    <div class="batch-tag" id="batch-tag"></div>
-  </div>
-  <div class="field-row">
-    <div class="field-label" id="lbl-upc">UPC / SKU</div>
-    <input type="text" id="upc-input" placeholder="Scan UPC…" autocomplete="off"
-           autocorrect="off" autocapitalize="off" spellcheck="false" disabled>
-  </div>
+  <div class="field-label" id="lbl-scan">BT / GT Number</div>
+  <input type="text" id="scan-input" placeholder="Scan BT or GT barcode…"
+         autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
 </div>
 
-<!-- Result -->
 <div id="result-area"></div>
 
 <script>
-// ── i18n ──────────────────────────────────────────────────────────────────
 const STRINGS = {
   en: {
-    title: "Warehouse Recommendation", batch: "Batch Number", upc: "UPC / SKU",
-    bt_ph: "Scan batch barcode…", upc_ph: "Scan UPC or SKU…",
-    upc_first: "Set batch first", not_found: "❌ No record for this batch + SKU",
-    upc_nf: "❌ UPC not found", loading: "Looking up…",
-    rec: "PUT AWAY TO", lbl_batch: "Batch", lbl_sku: "SKU", lbl_qty: "Qty",
+    title: "Putaway Guide",
+    scan_lbl: "BT / GT Number",
+    scan_ph:  "Scan BT or GT barcode…",
+    invalid:  "⚠ Must start with BT or GT",
+    not_found:"❌ Not found",
+    loading:  "Looking up…",
+    rec:      "PUT AWAY TO",
+    lbl_bt: "BT", lbl_gt: "GT", lbl_sku: "SKU", lbl_qty: "Qty",
     lbl_product: "Product", lbl_exp: "Expiry", lbl_recv: "Recv'd", lbl_by: "By",
-    no_exp: "No expiry date", no_z1: "No Zone 1 stock", db_err: "Zone 1 query failed",
+    lbl_seg: "Segment", lbl_d2s: "FC D2S", lbl_sfc: "SFC Qty",
   },
   es: {
-    title: "Recomendación de Almacén", batch: "Número de Lote", upc: "UPC / SKU",
-    bt_ph: "Escanear código BT…", upc_ph: "Escanear UPC o SKU…",
-    upc_first: "Escanee lote primero", not_found: "❌ Sin registro para este lote + SKU",
-    upc_nf: "❌ UPC no encontrado", loading: "Buscando…",
-    rec: "ALMACENAR EN", lbl_batch: "Lote", lbl_sku: "SKU", lbl_qty: "Cant",
+    title: "Guía de Almacenamiento",
+    scan_lbl: "Número BT / GT",
+    scan_ph:  "Escanear BT o GT…",
+    invalid:  "⚠ Debe empezar con BT o GT",
+    not_found:"❌ No encontrado",
+    loading:  "Buscando…",
+    rec:      "ALMACENAR EN",
+    lbl_bt: "BT", lbl_gt: "GT", lbl_sku: "SKU", lbl_qty: "Cant",
     lbl_product: "Producto", lbl_exp: "Vence", lbl_recv: "Recibido", lbl_by: "Por",
-    no_exp: "Sin fecha", no_z1: "Sin stock Zona 1", db_err: "Error Zona 1",
+    lbl_seg: "Segmento", lbl_d2s: "FC D2S", lbl_sfc: "SFC Qty",
   },
   zh: {
-    title: "仓库推荐", batch: "批次号", upc: "UPC / SKU",
-    bt_ph: "扫 Batch 条码…", upc_ph: "扫 UPC 或 SKU…",
-    upc_first: "请先扫批次", not_found: "❌ 未找到该批次 + SKU",
-    upc_nf: "❌ UPC 不存在", loading: "查询中…",
-    rec: "上架至", lbl_batch: "批次", lbl_sku: "SKU", lbl_qty: "数量",
+    title: "上架指引",
+    scan_lbl: "BT / GT 批次号",
+    scan_ph:  "扫 BT 或 GT 条码…",
+    invalid:  "⚠ 需以 BT 或 GT 开头",
+    not_found:"❌ 未找到",
+    loading:  "查询中…",
+    rec:      "上架至",
+    lbl_bt: "BT", lbl_gt: "GT", lbl_sku: "SKU", lbl_qty: "数量",
     lbl_product: "商品", lbl_exp: "到期日", lbl_recv: "收货", lbl_by: "收货人",
-    no_exp: "无到期日", no_z1: "Zone 1 无库存", db_err: "Zone 1 查询失败",
+    lbl_seg: "分类", lbl_d2s: "FC 库存天", lbl_sfc: "SFC 数量",
   },
 };
+
 let lang = localStorage.getItem("loc_lang") || "en";
 let S = STRINGS[lang];
 
 function setLang(l) {
-  lang = l;
-  S = STRINGS[l];
+  lang = l; S = STRINGS[l];
   localStorage.setItem("loc_lang", l);
   applyStrings();
 }
-
 function applyStrings() {
-  document.getElementById("app-title").textContent = S.title;
-  document.getElementById("lbl-batch").textContent = S.batch;
-  document.getElementById("lbl-upc").textContent   = S.upc;
-  document.getElementById("bt-input").placeholder  = S.bt_ph;
-  document.getElementById("upc-input").placeholder = S.upc_ph;
-  document.getElementById("lang-sel").value = lang;
+  document.getElementById("app-title").textContent   = S.title;
+  document.getElementById("lbl-scan").textContent    = S.scan_lbl;
+  document.getElementById("scan-input").placeholder  = S.scan_ph;
+  document.getElementById("lang-sel").value          = lang;
 }
 applyStrings();
 
-// ── State ─────────────────────────────────────────────────────────────────
-let btNumber = null;
+const scanInput  = document.getElementById("scan-input");
+const resultArea = document.getElementById("result-area");
 let scanning = false;
 
-const btInput  = document.getElementById("bt-input");
-const upcInput = document.getElementById("upc-input");
-const batchTag = document.getElementById("batch-tag");
-const resultArea = document.getElementById("result-area");
-
-// ── Scanner debounce ──────────────────────────────────────────────────────
-// Scanners type very fast, then send Enter. Debounce handles both:
-// - Hardware Enter key → immediate submit
-// - Soft keyboard without Enter → 350ms idle triggers submit
-
-function makeScanner(inp, onSubmit) {
-  let timer = null;
-  const DELAY = 350;
-
-  inp.addEventListener("keydown", function(e) {
-    if (e.key === "Enter") {
-      clearTimeout(timer);
-      e.preventDefault();
-      onSubmit(inp.value.trim());
-      inp.value = "";
-    }
-  });
-
-  inp.addEventListener("input", function() {
-    clearTimeout(timer);
-    if (inp.value.length >= 4) {
-      timer = setTimeout(function() {
-        const val = inp.value.trim();
-        if (val.length >= 4) {
-          onSubmit(val);
-          inp.value = "";
-        }
-      }, DELAY);
-    }
-  });
-}
-
-// ── BT handler ───────────────────────────────────────────────────────────
-makeScanner(btInput, function(val) {
-  const raw = val.toUpperCase();
-  if (!raw.startsWith("BT") || !/^\d+$/.test(raw.slice(2))) {
-    showError("⚠ Invalid batch number (must start with BT)");
-    return;
+// ── Scanner: hardware Enter OR 350ms idle after ≥4 chars ─────────────────
+let _t = null;
+scanInput.addEventListener("keydown", function(e) {
+  if (e.key === "Enter") {
+    clearTimeout(_t);
+    e.preventDefault();
+    submit(scanInput.value.trim());
+    scanInput.value = "";
   }
-  btNumber = raw;
-  batchTag.textContent = "✓ " + raw;
-  btInput.classList.add("confirmed");
-  upcInput.disabled = false;
-  upcInput.classList.remove("confirmed");
-  resultArea.innerHTML = "";
-  // Move cursor to UPC after BT scanned
-  upcInput.focus();
+});
+scanInput.addEventListener("input", function() {
+  clearTimeout(_t);
+  if (scanInput.value.length >= 4) {
+    _t = setTimeout(function() {
+      const v = scanInput.value.trim();
+      if (v.length >= 4) { submit(v); scanInput.value = ""; }
+    }, 350);
+  }
 });
 
-// ── UPC handler ───────────────────────────────────────────────────────────
-makeScanner(upcInput, function(val) {
-  if (!btNumber) {
-    showError(S.upc_first);
-    return;
-  }
-  if (val.length < 4) return;
-  upcInput.classList.remove("confirmed");
-  doLookup(btNumber, val);
-});
+// ── Submit ────────────────────────────────────────────────────────────────
+async function submit(raw) {
+  const val = raw.toUpperCase();
+  const isBT = val.startsWith("BT") && /^\d+$/.test(val.slice(2));
+  const isGT = val.startsWith("GT");
+  if (!isBT && !isGT) { showError(S.invalid); return; }
 
-// ── Lookup ────────────────────────────────────────────────────────────────
-async function doLookup(bt, upc) {
   if (scanning) return;
   scanning = true;
+  scanInput.classList.remove("ok", "err");
   resultArea.innerHTML = `<div class="spinner">${S.loading}</div>`;
-
-  // Blur to hide keyboard so result is visible
-  upcInput.blur();
+  scanInput.blur();
 
   try {
-    const url = `/api/scan?bt=${encodeURIComponent(bt)}&upc=${encodeURIComponent(upc)}&lang=${lang}`;
+    const url = `/api/scan_id?id=${encodeURIComponent(val)}&lang=${lang}`;
     const res = await fetch(url);
-    const data = await res.json();
+    const d   = await res.json();
 
-    if (data.error) {
-      const msg = data.error === "not_found" ? S.not_found
-                : data.error === "upc_not_found" ? S.upc_nf
-                : "❌ " + data.error;
-      upcInput.classList.remove("confirmed");
-      showError(msg);
+    if (d.error) {
+      scanInput.classList.add("err");
+      showError(d.error === "not_found" ? S.not_found : "❌ " + (d.msg || d.error));
     } else {
-      upcInput.classList.add("confirmed");
-      showResult(data);
+      scanInput.classList.add("ok");
+      showResult(d);
     }
   } catch(e) {
     showError("❌ Network error: " + e.message);
   } finally {
     scanning = false;
-    upcInput.value = "";
-    upcInput.blur();  // dismiss keyboard, no re-focus
+    setTimeout(() => { scanInput.focus(); }, 100);
   }
 }
 
-// ── Render result ─────────────────────────────────────────────────────────
+// ── Render ────────────────────────────────────────────────────────────────
+function segTag(seg) {
+  if (!seg || seg === "—") return "";
+  const cls = {TOP:"tag-top", MIDDLE:"tag-mid", TAIL:"tag-tail", TBD:"tag-tbd"}[seg] || "";
+  return `<span class="tag ${cls}">${seg}</span>`;
+}
+
 function showResult(d) {
-  const rec  = d.rec || {};
-  const dest = rec.dest || "SFC";
-  const cls  = dest === "NJFC" ? "njfc" : "sfc";
-  const arrow = dest === "NJFC" ? "🔴" : "🟢";
+  const rec    = d.rec || {};
+  const color  = rec.color || "green";
+  const dest   = rec.dest  || "SFC";
+  const rule   = rec.rule  || "";
+  const reason = rec.reason|| "";
+  const arrow  = color === "green" ? "🟢" : color === "yellow" ? "🟡" : "🔴";
+  const d2s    = d.fc_d2s != null ? d.fc_d2s + "d" : "—";
+  const sfc    = d.sfc_qty != null ? Math.round(d.sfc_qty) : "—";
+  const gt     = d.group_batch_id || "—";
 
   resultArea.innerHTML = `
     <div class="info-card">
-      <b>${S.lbl_batch}:</b> ${d.batch_number} &nbsp;
-      <b>${S.lbl_sku}:</b> ${d.item_number} &nbsp;
-      <b>${S.lbl_qty}:</b> ${d.quantity}<br>
+      <b>${S.lbl_bt}:</b> ${d.batch_number}
+      ${gt !== "—" ? `&nbsp;<b>${S.lbl_gt}:</b> ${gt}` : ""}
+      &nbsp;<b>${S.lbl_sku}:</b> ${d.item_number}<br>
       <b>${S.lbl_product}:</b> ${d.product || "—"}<br>
-      <b>${S.lbl_exp}:</b> ${d.exp_date||"—"} &nbsp;
-      <b>${S.lbl_recv}:</b> ${d.recv_time||"—"} &nbsp;
-      <b>${S.lbl_by}:</b> ${d.receiver||"—"}
+      <b>${S.lbl_qty}:</b> ${d.quantity}
+      &nbsp;<b>${S.lbl_exp}:</b> ${d.exp_date||"—"}
+      &nbsp;<b>${S.lbl_recv}:</b> ${d.recv_time||"—"}<br>
+      <b>${S.lbl_seg}:</b> ${segTag(d.seg)}
+      &nbsp;<b>${S.lbl_d2s}:</b> ${d2s}
+      &nbsp;<b>${S.lbl_sfc}:</b> ${sfc}
     </div>
-    <div class="rec-banner ${cls}">
+    <div class="rec-banner ${color}">
       <div class="rec-dest">${arrow} ${S.rec} ${dest}</div>
-      <div class="rec-reason">${rec.reason||""}</div>
+      <div class="rec-rule">${rule}</div>
+      <div class="rec-reason">${reason}</div>
     </div>`;
 }
 
@@ -503,7 +660,8 @@ function showError(msg) {
   resultArea.innerHTML = `<div class="error-msg">${msg}</div>`;
 }
 
-// ── Initial focus ─────────────────────────────────────────────────────────
+// ── Auto-focus on load ────────────────────────────────────────────────────
+window.addEventListener("load", () => scanInput.focus());
 </script>
 </body>
 </html>
