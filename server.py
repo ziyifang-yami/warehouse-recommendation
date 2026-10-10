@@ -1,5 +1,5 @@
 """
-LOC Recommendation — FastAPI backend
+Warehouse Recommendationommendation — FastAPI backend
 Serves a single HTML page and two JSON API endpoints.
 Run: uvicorn server:app --host 0.0.0.0 --port 8504
 """
@@ -181,7 +181,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<title>LOC Rec</title>
+<title>Warehouse Recommendation</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
 
@@ -297,7 +297,7 @@ input[type=text]:disabled { color: #aaa; background: #f0f0f0; }
 
 <!-- Header -->
 <div id="header">
-  <span class="title">📦 <span id="app-title">LOC Rec</span></span>
+  <span class="title">📦 <span id="app-title">Warehouse Recommendation</span></span>
   <select id="lang-sel" onchange="setLang(this.value)">
     <option value="en">EN</option>
     <option value="es">ES</option>
@@ -327,7 +327,7 @@ input[type=text]:disabled { color: #aaa; background: #f0f0f0; }
 // ── i18n ──────────────────────────────────────────────────────────────────
 const STRINGS = {
   en: {
-    title: "LOC Rec", batch: "Batch Number", upc: "UPC / SKU",
+    title: "Warehouse Recommendation", batch: "Batch Number", upc: "UPC / SKU",
     bt_ph: "Scan batch barcode…", upc_ph: "Scan UPC or SKU…",
     upc_first: "Set batch first", not_found: "❌ No record for this batch + SKU",
     upc_nf: "❌ UPC not found", loading: "Looking up…",
@@ -336,7 +336,7 @@ const STRINGS = {
     no_exp: "No expiry date", no_z1: "No Zone 1 stock", db_err: "Zone 1 query failed",
   },
   es: {
-    title: "Rec Ubicación", batch: "Número de Lote", upc: "UPC / SKU",
+    title: "Recomendación de Almacén", batch: "Número de Lote", upc: "UPC / SKU",
     bt_ph: "Escanear código BT…", upc_ph: "Escanear UPC o SKU…",
     upc_first: "Escanee lote primero", not_found: "❌ Sin registro para este lote + SKU",
     upc_nf: "❌ UPC no encontrado", loading: "Buscando…",
@@ -345,7 +345,7 @@ const STRINGS = {
     no_exp: "Sin fecha", no_z1: "Sin stock Zona 1", db_err: "Error Zona 1",
   },
   zh: {
-    title: "货位推荐", batch: "批次号", upc: "UPC / SKU",
+    title: "仓库推荐", batch: "批次号", upc: "UPC / SKU",
     bt_ph: "扫 Batch 条码…", upc_ph: "扫 UPC 或 SKU…",
     upc_first: "请先扫批次", not_found: "❌ 未找到该批次 + SKU",
     upc_nf: "❌ UPC 不存在", loading: "查询中…",
@@ -383,54 +383,41 @@ const upcInput = document.getElementById("upc-input");
 const batchTag = document.getElementById("batch-tag");
 const resultArea = document.getElementById("result-area");
 
-// ── Global background scanner capture ────────────────────────────────────
-// No focus needed. All keystrokes are captured at document level and
-// routed: BT-format → batch field, anything else → UPC field (if batch set).
-// Works with USB/Bluetooth hardware scanners and Zebra/Honeywell devices.
+// ── Scanner debounce ──────────────────────────────────────────────────────
+// Scanners type very fast, then send Enter. Debounce handles both:
+// - Hardware Enter key → immediate submit
+// - Soft keyboard without Enter → 350ms idle triggers submit
 
-let bgBuffer = "";
-let bgTimer  = null;
-const DELAY  = 350;
+function makeScanner(inp, onSubmit) {
+  let timer = null;
+  const DELAY = 350;
 
-function bgFlush() {
-  const val = bgBuffer.trim();
-  bgBuffer = "";
-  if (!val || val.length < 4) return;
+  inp.addEventListener("keydown", function(e) {
+    if (e.key === "Enter") {
+      clearTimeout(timer);
+      e.preventDefault();
+      onSubmit(inp.value.trim());
+      inp.value = "";
+    }
+  });
 
-  const raw = val.toUpperCase();
-
-  // Detect BT format: starts with BT followed by digits
-  if (raw.startsWith("BT") && /^\d+$/.test(raw.slice(2))) {
-    // Show in BT field briefly so user sees what was scanned
-    btInput.value = raw;
-    setTimeout(() => { btInput.value = ""; }, 600);
-    onBtSubmit(raw);
-  } else {
-    // UPC / SKU
-    upcInput.value = raw;
-    setTimeout(() => { upcInput.value = ""; }, 600);
-    onUpcSubmit(raw);
-  }
+  inp.addEventListener("input", function() {
+    clearTimeout(timer);
+    if (inp.value.length >= 4) {
+      timer = setTimeout(function() {
+        const val = inp.value.trim();
+        if (val.length >= 4) {
+          onSubmit(val);
+          inp.value = "";
+        }
+      }, DELAY);
+    }
+  });
 }
 
-document.addEventListener("keydown", function(e) {
-  // Ignore modifier keys and special keys except Enter
-  if (e.ctrlKey || e.altKey || e.metaKey) return;
-  if (e.key === "Enter") {
-    clearTimeout(bgTimer);
-    bgFlush();
-    return;
-  }
-  // Only capture printable single characters
-  if (e.key.length === 1) {
-    bgBuffer += e.key;
-    clearTimeout(bgTimer);
-    bgTimer = setTimeout(bgFlush, DELAY);
-  }
-});
-
-// ── BT submit handler ─────────────────────────────────────────────────────
-function onBtSubmit(raw) {
+// ── BT handler ───────────────────────────────────────────────────────────
+makeScanner(btInput, function(val) {
+  const raw = val.toUpperCase();
   if (!raw.startsWith("BT") || !/^\d+$/.test(raw.slice(2))) {
     showError("⚠ Invalid batch number (must start with BT)");
     return;
@@ -441,10 +428,12 @@ function onBtSubmit(raw) {
   upcInput.disabled = false;
   upcInput.classList.remove("confirmed");
   resultArea.innerHTML = "";
-}
+  // Move cursor to UPC after BT scanned
+  upcInput.focus();
+});
 
-// ── UPC submit handler ────────────────────────────────────────────────────
-function onUpcSubmit(val) {
+// ── UPC handler ───────────────────────────────────────────────────────────
+makeScanner(upcInput, function(val) {
   if (!btNumber) {
     showError(S.upc_first);
     return;
@@ -452,22 +441,6 @@ function onUpcSubmit(val) {
   if (val.length < 4) return;
   upcInput.classList.remove("confirmed");
   doLookup(btNumber, val);
-}
-
-// Keep input fields working for manual typing too (fallback)
-btInput.addEventListener("keydown", function(e) {
-  if (e.key === "Enter") {
-    e.stopPropagation(); // prevent double-fire with bg listener
-    onBtSubmit(btInput.value.trim().toUpperCase());
-    btInput.value = "";
-  }
-});
-upcInput.addEventListener("keydown", function(e) {
-  if (e.key === "Enter") {
-    e.stopPropagation();
-    onUpcSubmit(upcInput.value.trim());
-    upcInput.value = "";
-  }
 });
 
 // ── Lookup ────────────────────────────────────────────────────────────────
@@ -498,12 +471,8 @@ async function doLookup(bt, upc) {
     showError("❌ Network error: " + e.message);
   } finally {
     scanning = false;
-    // Re-focus BT for next batch scan
-    setTimeout(() => {
-      upcInput.value = "";
-      btInput.value = "";
-      btInput.focus();
-    }, 400);
+    upcInput.value = "";
+    upcInput.blur();  // dismiss keyboard, no re-focus
   }
 }
 
@@ -535,7 +504,6 @@ function showError(msg) {
 }
 
 // ── Initial focus ─────────────────────────────────────────────────────────
-btInput.focus();
 </script>
 </body>
 </html>

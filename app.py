@@ -122,41 +122,28 @@ for k, v in DEFAULTS.items():
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# Header: title + compact native HTML <select> for language
+# Header: title + st.selectbox (tiny, right-aligned)
 # ---------------------------------------------------------------------------
-_qp = st.query_params
-if "lang" in _qp and _qp["lang"] in ("en", "es", "zh"):
-    if _qp["lang"] != st.session_state.lang:
-        st.session_state.lang = _qp["lang"]
-        st.query_params.clear()
+_title_col, _lang_col = st.columns([8, 1])
+with _title_col:
+    st.markdown(
+        f"<p style='font-size:1rem;font-weight:700;margin:0;padding-top:4px'>📦 {t('title')}</p>",
+        unsafe_allow_html=True,
+    )
+with _lang_col:
+    _lang_labels = list(LANGS.keys())
+    _lang_codes  = list(LANGS.values())
+    _chosen = st.selectbox(
+        "🌐",
+        _lang_labels,
+        index=_lang_codes.index(st.session_state.lang),
+        key="lang_sel",
+        label_visibility="collapsed",
+    )
+    if LANGS[_chosen] != st.session_state.lang:
+        st.session_state.lang = LANGS[_chosen]
         st.rerun()
 
-_lang_now = st.session_state.lang
-_opts = {"en": "EN", "es": "ES", "zh": "中文"}
-_options_html = "".join(
-    f'<option value="{code}" {"selected" if code == _lang_now else ""}>{label}</option>'
-    for code, label in _opts.items()
-)
-components.html(f"""
-<div style="display:flex;align-items:center;justify-content:space-between;
-            padding:0 4px;margin-bottom:0">
-  <span style="font-size:1rem;font-weight:700">📦 {t('title')}</span>
-  <select id="ls"
-    style="font-size:0.8rem;padding:2px 6px;border:1px solid #ccc;
-           border-radius:4px;background:#fff;height:28px;cursor:pointer;
-           -webkit-appearance:auto">
-    {_options_html}
-  </select>
-</div>
-<script>
-document.getElementById('ls').addEventListener('change',function(){{
-  var u=new URL(window.parent.location.href);
-  u.searchParams.set('lang',this.value);
-  window.parent.location.href=u.toString();
-}});
-</script>
-""", height=40)
-st.markdown("<hr style='margin:0.1rem 0'>", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # DB helpers
@@ -256,36 +243,63 @@ def _on_upc():
 # ---------------------------------------------------------------------------
 # JS: focus a specific input by placeholder
 # ---------------------------------------------------------------------------
+# JS: focus + auto-submit on scan (blur-based, works on Android Chrome)
+# Barcode scanners type fast then send Enter. On mobile, simulated
+# KeyboardEvents don't reliably trigger Streamlit on_change.
+# Strategy: debounce the input event, then blur() the field.
+# Streamlit fires on_change on blur, so this is the most reliable approach.
+# ---------------------------------------------------------------------------
 def _focus_js(placeholder):
     safe = placeholder.replace("'", "\\'")
     return f"""<script>
-(function go(){{
-  const doc = window.parent.document;
-  const el = doc.querySelector("input[placeholder='{safe}']");
-  if(el){{ el.focus(); el.select(); }} else {{ setTimeout(go,120); }}
+(function(){{
+  var _t = null;
+  function autoSubmit(inp){{
+    // blur triggers Streamlit on_change reliably on mobile
+    inp.blur();
+    // re-focus after a short delay so next scan lands in the right field
+    setTimeout(function(){{ inp.focus(); }}, 50);
+  }}
+  function attach(inp){{
+    if(inp._auto_attached) return;
+    inp._auto_attached = true;
+    inp.addEventListener('input', function(){{
+      clearTimeout(_t);
+      if(inp.value.length >= 5){{
+        // 280ms: enough time for scanner to finish sending all chars
+        _t = setTimeout(function(){{ autoSubmit(inp); }}, 280);
+      }}
+    }});
+    // Also handle physical Enter key (USB/Bluetooth scanners on desktop)
+    inp.addEventListener('keydown', function(e){{
+      if(e.key === 'Enter'){{
+        clearTimeout(_t);
+      }}
+    }});
+  }}
+  function go(){{
+    const doc = window.parent.document;
+    const el = doc.querySelector("input[placeholder='{safe}']");
+    if(el){{ el.focus(); el.select(); attach(el); }}
+    else {{ setTimeout(go, 120); }}
+  }}
+  go();
 }})();
 </script>"""
 
 # ---------------------------------------------------------------------------
-# BT row
+# BT row — full width, no badge column
 # ---------------------------------------------------------------------------
 bt_ph = t("bt_ph")
-bt_l, bt_r = st.columns([4, 1])
-with bt_l:
-    st.text_input("bt", placeholder=bt_ph, key="_bt_field",
-                  label_visibility="collapsed", on_change=_on_bt)
-with bt_r:
-    # Show current BT as tiny badge, or "—"
-    val = st.session_state.bt_number or "—"
-    st.markdown(
-        f"<div style='font-size:0.75rem;color:#555;padding-top:0.55rem;"
-        f"white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>{val}</div>",
-        unsafe_allow_html=True,
-    )
+st.text_input("bt", placeholder=bt_ph, key="_bt_field",
+              label_visibility="collapsed", on_change=_on_bt)
 
 if st.session_state.bt_err:
-    st.warning(t("bt_invalid"))
+    st.caption(t("bt_invalid"))
     st.session_state.bt_err = False
+
+if st.session_state.bt_number:
+    st.caption(f"✓ {st.session_state.bt_number}")
 
 # ---------------------------------------------------------------------------
 # UPC row (always shown, greyed-out hint when BT not set)
