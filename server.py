@@ -8,6 +8,7 @@ Run: uvicorn server:app --host 0.0.0.0 --port 8504
 
 import math
 import os
+import sqlite3
 from datetime import date
 from pathlib import Path
 import sys
@@ -48,6 +49,69 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"])
 PUTAWAY_CFG = {
     "putaway_d2s": 30,   # MIDDLE: FC D2S > this → new goods to SFC
 }
+
+# Segment thresholds (mirrors refresh_sfc_cache.py / config.py)
+_SEG_AOD_TOP  = 21    # active_order_days >= 21
+_SEG_OL_TOP   = 30    # order_lines_30d   >= 30
+_SEG_OL_TAIL  = 8     # order_lines_30d   < 8  → TAIL
+_TBD_DAYS     = 30    # inv_days_30 < 30 or NaN → TBD
+
+# Path to Allocation SQLite cache (same server, read-only)
+_CACHE_DB = Path("/opt/inv-allocation/results/sfc_cache.db")
+
+
+def _read_sku_from_cache(sku: str) -> dict:
+    """
+    Read segment inputs for one SKU from sfc_cache.db.
+    Returns dict with keys: inv_days_30, order_lines_30d, active_order_days, avg_daily_orders
+    Returns None if SKU not found or DB unavailable.
+    """
+    if not _CACHE_DB.exists():
+        return None
+    try:
+        with sqlite3.connect(f"file:{_CACHE_DB}?mode=ro", uri=True, timeout=5) as conn:
+            row = conn.execute(
+                "SELECT inv_days_30, order_lines_30d, active_order_days, avg_daily_orders "
+                "FROM sales WHERE item_number=?", (sku,)
+            ).fetchone()
+            is_tbd = conn.execute(
+                "SELECT 1 FROM tbd_skus WHERE item_number=?", (sku,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "inv_days_30":       row[0],
+            "order_lines_30d":   row[1],
+            "active_order_days": row[2],
+            "avg_daily_orders":  row[3],
+            "is_tbd":            is_tbd is not None,
+        }
+    except Exception:
+        return None
+
+
+def _classify_segment(cache: dict) -> str:
+    """Apply our segment classification from cached sales data."""
+    if cache is None:
+        return None
+    if cache["is_tbd"]:
+        return "TBD"
+    inv_days = cache["inv_days_30"]
+    # TBD: new product (inv_days_30 < 30 or NaN)
+    if inv_days is None or (isinstance(inv_days, float) and (inv_days != inv_days)):  # NaN
+        return "TBD"
+    try:
+        if float(inv_days) < _TBD_DAYS:
+            return "TBD"
+    except Exception:
+        return "TBD"
+    ol  = float(cache["order_lines_30d"]  or 0)
+    aod = float(cache["active_order_days"] or 0)
+    if aod >= _SEG_AOD_TOP and ol >= _SEG_OL_TOP:
+        return "TOP"
+    if ol < _SEG_OL_TAIL:
+        return "TAIL"
+    return "MIDDLE"
 
 # ---------------------------------------------------------------------------
 # DB helpers
@@ -99,15 +163,24 @@ def lookup_by_gt(gt_str: str):
 
 def query_sku_inventory(sku: str, wh: str = "002") -> dict:
     """
-    Fetch live inventory + segment data for putaway decision.
-    Returns: seg, fc_d2s, sfc_qty, fc_min_exp_date, need_minimal_exp
+    Fetch live inventory + segment for putaway decision.
+    - Segment: from sfc_cache.db (our own TOP/MIDDLE/TAIL/TBD classification)
+    - FC D2S:  live FC qty / avg_daily_orders from cache
+    - SFC qty: live from MySQL WH inventory
     """
     result = {
         "seg": None, "fc_d2s": None, "sfc_qty": 0.0,
         "fc_min_exp_date": None, "need_minimal_exp": 0,
+        "avg_daily_orders": 0.0,
     }
 
-    # FC qty, SFC qty, FC oldest expiry
+    # ── Step 1: segment + avg_daily from SQLite cache ─────────────────────
+    cache = _read_sku_from_cache(sku)
+    result["seg"] = _classify_segment(cache)
+    if cache:
+        result["avg_daily_orders"] = float(cache.get("avg_daily_orders") or 0)
+
+    # ── Step 2: live FC qty, SFC qty, FC oldest expiry from MySQL ─────────
     try:
         sql_inv = text("""
             SELECT
@@ -134,8 +207,8 @@ def query_sku_inventory(sku: str, wh: str = "002") -> dict:
         with engine.connect() as c:
             df_inv = pd.read_sql(sql_inv, c, params={"wh": wh, "sku": sku})
         if not df_inv.empty:
-            result["sfc_qty"] = float(df_inv.iloc[0]["sfc_qty"] or 0)
             fc_qty = float(df_inv.iloc[0]["fc_qty"] or 0)
+            result["sfc_qty"] = float(df_inv.iloc[0]["sfc_qty"] or 0)
             min_exp = df_inv.iloc[0]["fc_min_exp_dtm"]
             if min_exp and int(min_exp) > 0:
                 result["fc_min_exp_date"] = date.fromtimestamp(int(min_exp)).isoformat()
@@ -145,42 +218,10 @@ def query_sku_inventory(sku: str, wh: str = "002") -> dict:
     except Exception:
         fc_qty = 0.0
 
-    # Sales data for segment + D2S
-    try:
-        sql_seg = text("""
-            SELECT
-              COALESCE(SUM(od.quantity),0)        AS qty_30,
-              COUNT(DISTINCT od.order_id)         AS order_lines_30,
-              COUNT(DISTINCT CASE WHEN od.created_at >= UNIX_TIMESTAMP(NOW()-INTERVAL 90 DAY)
-                                  THEN DATE(FROM_UNIXTIME(od.created_at)) END) AS active_days_90
-            FROM yamibuy_order.oc_order_detail od
-            JOIN yamibuy_order.oc_order o ON o.order_id=od.order_id
-            WHERE od.item_number=:sku
-              AND od.created_at >= UNIX_TIMESTAMP(NOW()-INTERVAL 30 DAY)
-              AND o.order_status NOT IN (7,8)
-        """)
-        with engine.connect() as c:
-            df_seg = pd.read_sql(sql_seg, c, params={"sku": sku})
-
-        if not df_seg.empty:
-            qty_30      = float(df_seg.iloc[0]["qty_30"] or 0)
-            order_lines = int(df_seg.iloc[0]["order_lines_30"] or 0)
-            active_days = int(df_seg.iloc[0]["active_days_90"] or 0)
-            avg_daily   = qty_30 / 30.0
-
-            if active_days >= 21 and order_lines >= 30:
-                seg = "TOP"
-            elif order_lines < 8:
-                seg = "TAIL"
-            else:
-                seg = "MIDDLE"
-
-            result["seg"] = seg
-
-            if avg_daily > 0 and fc_qty > 0:
-                result["fc_d2s"] = round(fc_qty / avg_daily, 1)
-    except Exception:
-        pass
+    # ── Step 3: FC D2S = fc_qty / avg_daily_orders ────────────────────────
+    adl = result["avg_daily_orders"]
+    if adl and adl > 0 and fc_qty > 0:
+        result["fc_d2s"] = round(fc_qty / adl, 1)
 
     return result
 
@@ -238,78 +279,18 @@ def decide_putaway(seg, fc_d2s, sfc_qty, need_exp, new_exp_date,
 
 
 # ---------------------------------------------------------------------------
-# API — new single-scan endpoint
-# ---------------------------------------------------------------------------
-@app.get("/api/scan_id")
-async def scan_id(id: str, lang: str = "en"):
-    """
-    Scan BT{rec_Id} or GT{…} — resolves SKU automatically.
-    Returns batch info + inventory context + putaway decision.
-    """
-    raw = id.strip().upper()
-    try:
-        if raw.startswith("BT") and raw[2:].isdigit():
-            row = lookup_by_bt(raw)
-        elif raw.startswith("GT"):
-            row = lookup_by_gt(raw)
-        else:
-            return JSONResponse({"error": "invalid_id",
-                                 "msg": "Must start with BT or GT"})
-
-        if row is None:
-            return JSONResponse({"error": "not_found"})
-
-        sku      = str(row["item_number"])
-        exp_date = str(row["exp_date"]) if row.get("exp_date") else None
-        gt       = str(row.get("group_batch_id") or "")
-
-        product = (_strip_i18n(str(row.get("goods_name", "") or ""))
-                   if lang == "zh"
-                   else _strip_i18n(str(row.get("goods_en_name", "") or "")))
-        if not product:
-            product = _strip_i18n(str(row.get("goods_name", "") or ""))
-
-        inv = query_sku_inventory(sku)
-
-        rec = decide_putaway(
-            seg            = inv["seg"],
-            fc_d2s         = inv["fc_d2s"],
-            sfc_qty        = inv["sfc_qty"],
-            need_exp       = inv["need_minimal_exp"],
-            new_exp_date   = exp_date,
-            fc_min_exp_date= inv["fc_min_exp_date"],
-            cfg            = PUTAWAY_CFG,
-        ) if inv["seg"] else {
-            "dest": "SFC", "rule": "NO_SEG",
-            "reason": "No segment data — defaulting to SFC", "color": "green"
-        }
-
-        return JSONResponse({
-            "batch_number": str(row["batch_number"]),
-            "group_batch_id": gt,
-            "item_number":  sku,
-            "quantity":     int(row["quantity"]),
-            "product":      product,
-            "exp_date":     exp_date,
-            "recv_time":    str(row["recv_time_edt"])[:16] if row.get("recv_time_edt") else None,
-            "receiver":     str(row.get("receiver") or ""),
-            "seg":          inv["seg"] or "—",
-            "fc_d2s":       inv["fc_d2s"],
-            "sfc_qty":      inv["sfc_qty"],
-            "rec":          rec,
-        })
-
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-# ---------------------------------------------------------------------------
-# API — legacy UPC endpoint (kept for backwards compatibility)
+# API — main endpoint: BT/GT + UPC → putaway decision
 # ---------------------------------------------------------------------------
 @app.get("/api/scan")
 async def scan(bt: str, upc: str, lang: str = "en"):
+    """
+    bt  = BT{rec_Id} or GT{…}
+    upc = UPC barcode or item_number (SKU)
+    Resolves SKU from UPC, matches against the batch row, returns putaway decision.
+    """
+    raw_bt = bt.strip().upper()
     try:
-        # resolve UPC → SKU
+        # Step 1: resolve UPC → SKU + product name
         sql_upc = text("""
             SELECT u.item_number,
                    g.goods_name,
@@ -321,37 +302,68 @@ async def scan(bt: str, upc: str, lang: str = "en"):
             LIMIT 1
         """)
         with engine.connect() as c:
-            df = pd.read_sql(sql_upc, c, params={"v": upc.strip()})
-        if df.empty:
+            df_upc = pd.read_sql(sql_upc, c, params={"v": upc.strip()})
+        if df_upc.empty:
             return JSONResponse({"error": "upc_not_found"})
-        item_number = str(df.iloc[0]["item_number"])
+        item_number = str(df_upc.iloc[0]["item_number"])
 
-        row = lookup_by_bt(bt.strip().upper())
-        if row is None or str(row["item_number"]) != item_number:
+        # Step 2: look up batch row by BT or GT, verify SKU matches
+        if raw_bt.startswith("BT") and raw_bt[2:].isdigit():
+            row = lookup_by_bt(raw_bt)
+        elif raw_bt.startswith("GT"):
+            row = lookup_by_gt(raw_bt)
+        else:
+            return JSONResponse({"error": "invalid_bt",
+                                 "msg": "Batch must start with BT or GT"})
+
+        if row is None:
             return JSONResponse({"error": "not_found"})
 
-        exp_date = str(row["exp_date"]) if row.get("exp_date") else None
-        inv = query_sku_inventory(item_number)
-        rec = decide_putaway(
-            seg=inv["seg"], fc_d2s=inv["fc_d2s"], sfc_qty=inv["sfc_qty"],
-            need_exp=inv["need_minimal_exp"], new_exp_date=exp_date,
-            fc_min_exp_date=inv["fc_min_exp_date"], cfg=PUTAWAY_CFG,
-        ) if inv["seg"] else {"dest": "SFC", "rule": "NO_SEG",
-                              "reason": "No segment data", "color": "green"}
+        # SKU mismatch — the UPC doesn't belong to this batch
+        if str(row["item_number"]) != item_number:
+            return JSONResponse({"error": "sku_mismatch",
+                                 "msg": f"UPC resolves to SKU {item_number} but batch is SKU {row['item_number']}"})
 
-        product = (_strip_i18n(str(df.iloc[0]["goods_name"] or "")) if lang == "zh"
-                   else _strip_i18n(str(df.iloc[0]["goods_en_name"] or "")))
+        exp_date = str(row["exp_date"]) if row.get("exp_date") else None
+        gt       = str(row.get("group_batch_id") or "")
+
+        product = (_strip_i18n(str(df_upc.iloc[0]["goods_name"] or "")) if lang == "zh"
+                   else _strip_i18n(str(df_upc.iloc[0]["goods_en_name"] or "")))
+        if not product:
+            product = _strip_i18n(str(df_upc.iloc[0]["goods_name"] or ""))
+
+        # Step 3: get live inventory context
+        inv = query_sku_inventory(item_number)
+
+        # Step 4: putaway decision
+        rec = decide_putaway(
+            seg             = inv["seg"],
+            fc_d2s          = inv["fc_d2s"],
+            sfc_qty         = inv["sfc_qty"],
+            need_exp        = inv["need_minimal_exp"],
+            new_exp_date    = exp_date,
+            fc_min_exp_date = inv["fc_min_exp_date"],
+            cfg             = PUTAWAY_CFG,
+        ) if inv["seg"] else {
+            "dest": "SFC", "rule": "NO_SEG",
+            "reason": "No segment data — defaulting to SFC", "color": "green"
+        }
+
         return JSONResponse({
-            "batch_number": str(row["batch_number"]),
-            "item_number":  item_number,
-            "quantity":     int(row["quantity"]),
-            "product":      product,
-            "exp_date":     exp_date,
-            "exp_dtm":      int(row.get("exp_dtm") or 0),
-            "recv_time":    str(row["recv_time_edt"])[:16] if row.get("recv_time_edt") else None,
-            "receiver":     str(row.get("receiver") or ""),
-            "rec":          rec,
+            "batch_number":  str(row["batch_number"]),
+            "group_batch_id": gt,
+            "item_number":   item_number,
+            "quantity":      int(row["quantity"]),
+            "product":       product,
+            "exp_date":      exp_date,
+            "recv_time":     str(row["recv_time_edt"])[:16] if row.get("recv_time_edt") else None,
+            "receiver":      str(row.get("receiver") or ""),
+            "seg":           inv["seg"] or "—",
+            "fc_d2s":        inv["fc_d2s"],
+            "sfc_qty":       inv["sfc_qty"],
+            "rec":           rec,
         })
+
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
