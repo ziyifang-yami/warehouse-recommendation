@@ -229,6 +229,49 @@ def query_sku_inventory(sku: str, wh: str = "002") -> dict:
 # ---------------------------------------------------------------------------
 # Putaway decision engine (mirrors logic/putaway.py decide_putaway)
 # ---------------------------------------------------------------------------
+# Translated reasons per lang (rule → {lang: reason})
+_REASONS = {
+    "TBD_KEEP": {
+        "en": "New product (<30d in stock) — hold at receiving zone until classified",
+        "es": "Producto nuevo (<30d en inventario) — mantener en zona de recepción",
+        "zh": "新品（在库不足30天）— 暂留收货区，待分类后再上架",
+    },
+    "TOP_FC": {
+        "en": "TOP SKU — always stock in FC",
+        "es": "SKU TOP — siempre almacenar en FC",
+        "zh": "TOP 商品 — 始终上架至 FC",
+    },
+    "TAIL_SFC": {
+        "en": "TAIL SKU — always stock in SFC",
+        "es": "SKU TAIL — siempre almacenar en SFC",
+        "zh": "TAIL 商品 — 始终上架至 SFC",
+    },
+    "MID_EXP_EARLIER_FC": {
+        "en": "New goods expire earlier than FC stock — put in FC first (FEFO)",
+        "es": "Nuevos bienes vencen antes que el stock FC — poner en FC primero (FEFO)",
+        "zh": "新货到期日早于 FC 现有库存 — 先入 FC（先进先出）",
+    },
+    "MID_FC_D2S_HIGH": {
+        "en": "FC has sufficient stock (D2S>{d}d) — put new goods in SFC",
+        "es": "FC tiene stock suficiente (D2S>{d}d) — poner nuevos bienes en SFC",
+        "zh": "FC 库存充足（D2S>{d}天）— 新货上架至 SFC",
+    },
+    "MID_SFC_HAS_STOCK": {
+        "en": "FC needs replenishment but SFC has stock ({q} units) — put in SFC, wait for T2",
+        "es": "FC necesita reabastecimiento pero SFC tiene stock ({q} uds) — poner en SFC, esperar T2",
+        "zh": "FC 需要补货，但 SFC 有库存（{q} 件）— 先入 SFC，等待 T2 补货",
+    },
+    "MID_SFC_EMPTY": {
+        "en": "FC needs replenishment and SFC is empty — put directly in FC",
+        "es": "FC necesita reabastecimiento y SFC está vacío — poner directamente en FC",
+        "zh": "FC 需要补货且 SFC 无库存 — 直接上架至 FC",
+    },
+    "NO_SEG": {
+        "en": "No segment data — defaulting to SFC",
+        "es": "Sin datos de segmento — usando SFC por defecto",
+        "zh": "无分类数据 — 默认上架至 SFC",
+    },
+}
 def _sf(v, d=0.0):
     try:
         f = float(v)
@@ -238,44 +281,43 @@ def _sf(v, d=0.0):
 
 
 def decide_putaway(seg, fc_d2s, sfc_qty, need_exp, new_exp_date,
-                   fc_min_exp_date, cfg) -> dict:
+                   fc_min_exp_date, cfg, lang="en") -> dict:
     putaway_d2s = cfg.get("putaway_d2s", 30)
     fc_d2s  = _sf(fc_d2s)
     sfc_qty = _sf(sfc_qty)
 
+    def _r(rule, **kw):
+        tmpl = _REASONS.get(rule, {}).get(lang) or _REASONS.get(rule, {}).get("en", rule)
+        return tmpl.format(**kw)
+
     if seg == "TBD":
-        return {"dest": "Receiving Zone", "rule": "TBD_KEEP",
-                "reason": "New product (<30d in stock) — hold at receiving zone until classified",
-                "color": "yellow"}
+        return {"dest": "No need to Change Zone", "rule": "TBD_KEEP",
+                "reason": _r("TBD_KEEP"), "color": "yellow"}
 
     if seg == "TOP":
         return {"dest": "FC", "rule": "TOP_FC",
-                "reason": "TOP SKU — always stock in FC", "color": "red"}
+                "reason": _r("TOP_FC"), "color": "red"}
 
     if seg in ("TAIL", "BOTTOM"):
         return {"dest": "SFC", "rule": "TAIL_SFC",
-                "reason": "TAIL SKU — always stock in SFC", "color": "green"}
+                "reason": _r("TAIL_SFC"), "color": "green"}
 
     # MIDDLE
     if (need_exp == 1 and new_exp_date and fc_min_exp_date
             and new_exp_date < fc_min_exp_date):
         return {"dest": "FC", "rule": "MID_EXP_EARLIER_FC",
-                "reason": f"New goods expire earlier than FC stock ({new_exp_date} < {fc_min_exp_date}) — FC first (FEFO)",
-                "color": "red"}
+                "reason": _r("MID_EXP_EARLIER_FC"), "color": "red"}
 
     if fc_d2s > putaway_d2s:
         return {"dest": "SFC", "rule": "MID_FC_D2S_HIGH",
-                "reason": f"FC has sufficient stock (D2S {fc_d2s:.0f} > {putaway_d2s}d) — put new goods in SFC",
-                "color": "green"}
+                "reason": _r("MID_FC_D2S_HIGH", d=f"{fc_d2s:.0f}"), "color": "green"}
 
     if sfc_qty > 0:
         return {"dest": "SFC", "rule": "MID_SFC_HAS_STOCK",
-                "reason": f"FC needs replenishment but SFC has stock ({sfc_qty:.0f} units) — put in SFC, wait for T2",
-                "color": "green"}
+                "reason": _r("MID_SFC_HAS_STOCK", q=f"{sfc_qty:.0f}"), "color": "green"}
 
     return {"dest": "FC", "rule": "MID_SFC_EMPTY",
-            "reason": "FC needs replenishment and SFC is empty — put directly in FC",
-            "color": "red"}
+            "reason": _r("MID_SFC_EMPTY"), "color": "red"}
 
 
 # ---------------------------------------------------------------------------
@@ -311,10 +353,11 @@ async def scan_id(id: str, lang: str = "en"):
         rec = decide_putaway(
             seg=inv["seg"], fc_d2s=inv["fc_d2s"], sfc_qty=inv["sfc_qty"],
             need_exp=inv["need_minimal_exp"], new_exp_date=exp_date,
-            fc_min_exp_date=inv["fc_min_exp_date"], cfg=PUTAWAY_CFG,
+            fc_min_exp_date=inv["fc_min_exp_date"], cfg=PUTAWAY_CFG, lang=lang,
         ) if inv["seg"] else {
             "dest": "SFC", "rule": "NO_SEG",
-            "reason": "No segment data — defaulting to SFC", "color": "green",
+            "reason": _REASONS["NO_SEG"].get(lang, _REASONS["NO_SEG"]["en"]),
+            "color": "green",
         }
 
         return JSONResponse({
@@ -577,40 +620,44 @@ input[type=text].err    { border-color: #ea4335; background: #fef7f7; }
 <script>
 const STRINGS = {
   en: {
-    title: "Putaway Guide",
-    scan_lbl: "BT / GT Number",
-    scan_ph:  "Scan BT or GT barcode…",
-    invalid:  "⚠ Must start with BT or GT",
-    not_found:"❌ Not found",
-    loading:  "Looking up…",
-    rec:      "PUT AWAY TO",
+    title:     "Putaway Guide",
+    scan_lbl:  "BT / GT Number",
+    scan_ph:   "Scan BT or GT barcode…",
+    invalid:   "⚠ Must start with BT or GT",
+    not_found: "❌ Not found",
+    loading:   "Looking up…",
+    rec:       "PUT AWAY TO",
     lbl_bt: "BT", lbl_gt: "GT", lbl_sku: "SKU", lbl_qty: "Qty",
-    lbl_product: "Product", lbl_exp: "Expiry", lbl_recv: "Recv'd", lbl_by: "By",
+    lbl_product: "Product", lbl_exp: "Expiry", lbl_recv: "Received by",
     lbl_seg: "Segment", lbl_d2s: "FC D2S", lbl_sfc: "SFC Qty",
+    no_data: "—",
   },
   es: {
-    title: "Guía de Almacenamiento",
-    scan_lbl: "Número BT / GT",
-    scan_ph:  "Escanear BT o GT…",
-    invalid:  "⚠ Debe empezar con BT o GT",
-    not_found:"❌ No encontrado",
-    loading:  "Buscando…",
-    rec:      "ALMACENAR EN",
+    title:     "Guía de Almacenamiento",
+    scan_lbl:  "Número BT / GT",
+    scan_ph:   "Escanear BT o GT…",
+    invalid:   "⚠ Debe empezar con BT o GT",
+    not_found: "❌ No encontrado",
+    loading:   "Buscando…",
+    rec:       "ALMACENAR EN",
     lbl_bt: "BT", lbl_gt: "GT", lbl_sku: "SKU", lbl_qty: "Cant",
-    lbl_product: "Producto", lbl_exp: "Vence", lbl_recv: "Recibido", lbl_by: "Por",
-    lbl_seg: "Segmento", lbl_d2s: "FC D2S", lbl_sfc: "SFC Qty",
+    lbl_product: "Producto", lbl_exp: "Vence", lbl_recv: "Recibido por",
+    lbl_seg: "Segmento", lbl_d2s: "FC D2S", lbl_sfc: "Cant. SFC",
+    no_data: "—",
   },
   zh: {
-    title: "上架指引",
-    scan_lbl: "BT / GT 批次号",
-    scan_ph:  "扫 BT 或 GT 条码…",
-    invalid:  "⚠ 需以 BT 或 GT 开头",
-    not_found:"❌ 未找到",
-    loading:  "查询中…",
-    rec:      "上架至",
-    lbl_bt: "BT", lbl_gt: "GT", lbl_sku: "SKU", lbl_qty: "数量",
-    lbl_product: "商品", lbl_exp: "到期日", lbl_recv: "收货", lbl_by: "收货人",
-    lbl_seg: "分类", lbl_d2s: "FC 库存天", lbl_sfc: "SFC 数量",
+    title:     "上架指引",
+    scan_lbl:  "BT / GT 批次号",
+    scan_ph:   "扫 BT 或 GT 条码…",
+    invalid:   "⚠ 需以 BT 或 GT 开头",
+    not_found: "❌ 未找到",
+    loading:   "查询中…",
+    rec:       "上架至",
+    lbl_bt: "批次(BT)", lbl_gt: "上架组(GT)", lbl_sku: "商品编号",
+    lbl_qty: "数量",
+    lbl_product: "商品名称", lbl_exp: "到期日", lbl_recv: "收货人",
+    lbl_seg: "销售分类", lbl_d2s: "FC 库存天", lbl_sfc: "SFC 库存",
+    no_data: "—",
   },
 };
 
@@ -701,6 +748,8 @@ function showResult(d) {
   const rule   = rec.rule  || "";
   const reason = rec.reason|| "";
   const arrow  = color === "green" ? "🟢" : color === "yellow" ? "🟡" : "🔴";
+  // For yellow (TBD), show dest directly without "PUT AWAY TO" prefix
+  const bannerText = color === "yellow" ? dest : `${S.rec} ${dest}`;
   const d2s    = d.fc_d2s != null ? d.fc_d2s + "d" : "—";
   const sfc    = d.sfc_qty != null ? Math.round(d.sfc_qty) : "—";
   const gt     = d.group_batch_id || "—";
@@ -713,13 +762,13 @@ function showResult(d) {
       <b>${S.lbl_product}:</b> ${d.product || "—"}<br>
       <b>${S.lbl_qty}:</b> ${d.quantity}
       &nbsp;<b>${S.lbl_exp}:</b> ${d.exp_date||"—"}
-      &nbsp;<b>${S.lbl_recv}:</b> ${d.recv_time||"—"}<br>
+      &nbsp;<b>${S.lbl_recv}:</b> ${d.recv_time||"—"} ${d.receiver||""}<br>
       <b>${S.lbl_seg}:</b> ${segTag(d.seg)}
       &nbsp;<b>${S.lbl_d2s}:</b> ${d2s}
       &nbsp;<b>${S.lbl_sfc}:</b> ${sfc}
     </div>
     <div class="rec-banner ${color}">
-      <div class="rec-dest">${arrow} ${S.rec} ${dest}</div>
+      <div class="rec-dest">${arrow} ${bannerText}</div>
       <div class="rec-rule">${rule}</div>
       <div class="rec-reason">${reason}</div>
     </div>`;
