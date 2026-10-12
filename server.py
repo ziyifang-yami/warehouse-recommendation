@@ -279,7 +279,64 @@ def decide_putaway(seg, fc_d2s, sfc_qty, need_exp, new_exp_date,
 
 
 # ---------------------------------------------------------------------------
-# API — main endpoint: BT/GT + UPC → putaway decision
+# API — scan_id: scan BT or GT directly, no UPC needed
+# ---------------------------------------------------------------------------
+@app.get("/api/scan_id")
+async def scan_id(id: str, lang: str = "en"):
+    """Scan BT{rec_Id} or GT{…} — resolves SKU automatically."""
+    raw = id.strip().upper()
+    try:
+        if raw.startswith("BT") and raw[2:].isdigit():
+            row = lookup_by_bt(raw)
+        elif raw.startswith("GT"):
+            row = lookup_by_gt(raw)
+        else:
+            return JSONResponse({"error": "invalid_id", "msg": "Must start with BT or GT"})
+
+        if row is None:
+            return JSONResponse({"error": "not_found"})
+
+        sku      = str(row["item_number"])
+        exp_date = str(row["exp_date"]) if row.get("exp_date") and str(row.get("exp_date")) not in ("None", "NaT", "") else None
+        gt       = str(row.get("group_batch_id") or "")
+
+        product = (_strip_i18n(str(row.get("goods_name") or ""))
+                   if lang == "zh"
+                   else _strip_i18n(str(row.get("goods_en_name") or "")))
+        if not product:
+            product = _strip_i18n(str(row.get("goods_name") or ""))
+
+        inv = query_sku_inventory(sku)
+
+        rec = decide_putaway(
+            seg=inv["seg"], fc_d2s=inv["fc_d2s"], sfc_qty=inv["sfc_qty"],
+            need_exp=inv["need_minimal_exp"], new_exp_date=exp_date,
+            fc_min_exp_date=inv["fc_min_exp_date"], cfg=PUTAWAY_CFG,
+        ) if inv["seg"] else {
+            "dest": "SFC", "rule": "NO_SEG",
+            "reason": "No segment data — defaulting to SFC", "color": "green",
+        }
+
+        return JSONResponse({
+            "batch_number":   str(row["batch_number"]),
+            "group_batch_id": gt,
+            "item_number":    sku,
+            "quantity":       int(row["quantity"]),
+            "product":        product,
+            "exp_date":       exp_date,
+            "recv_time":      str(row["recv_time_edt"])[:16] if row.get("recv_time_edt") and str(row.get("recv_time_edt")) not in ("None","NaT") else None,
+            "receiver":       str(row.get("receiver") or ""),
+            "seg":            inv["seg"] or "—",
+            "fc_d2s":         inv["fc_d2s"],
+            "sfc_qty":        inv["sfc_qty"],
+            "rec":            rec,
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# API — legacy: BT + UPC → putaway decision
 # ---------------------------------------------------------------------------
 @app.get("/api/scan")
 async def scan(bt: str, upc: str, lang: str = "en"):
