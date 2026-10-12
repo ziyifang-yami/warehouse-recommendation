@@ -184,14 +184,14 @@ def query_sku_inventory(sku: str, wh: str = "002") -> dict:
     try:
         sql_inv = text("""
             SELECT
-              SUM(CASE WHEN sl.zone_id=1 AND sl.location_type IN (3,4)
-                       THEN inv.quantity ELSE 0 END)           AS fc_qty,
-              SUM(CASE WHEN sl.zone_id=2
-                       THEN inv.quantity ELSE 0 END)           AS sfc_qty,
-              MIN(CASE WHEN sl.zone_id=1 AND sl.location_type IN (3,4)
+              SUM(CASE WHEN sl.zone_id != 2 AND sl.location_type IN (3,4)
+                       THEN inv.quantity ELSE 0 END) AS fc_qty,
+              SUM(CASE WHEN sl.zone_id = 2  AND sl.location_type IN (3,4)
+                       THEN inv.quantity ELSE 0 END) AS sfc_qty,
+              MIN(CASE WHEN sl.zone_id != 2 AND sl.location_type IN (3,4)
                             AND COALESCE(sli.expire_dtm, sl.expire_dtm) > 0
                        THEN COALESCE(sli.expire_dtm, sl.expire_dtm)
-                       ELSE NULL END)                          AS fc_min_exp_dtm
+                       ELSE NULL END) AS fc_min_exp_dtm
             FROM yamibuy_wh.wh_inventory_transaction inv
             JOIN yamibuy_wh.wh_storage_location sl
               ON inv.location_no=sl.location_no
@@ -203,6 +203,7 @@ def query_sku_inventory(sku: str, wh: str = "002") -> dict:
             WHERE inv.warehouse_number=:wh
               AND inv.item_number=:sku
               AND inv.quantity>0
+              AND sl.location_type IN (3,4)
         """)
         with engine.connect() as c:
             df_inv = pd.read_sql(sql_inv, c, params={"wh": wh, "sku": sku})
@@ -291,7 +292,10 @@ def decide_putaway(seg, fc_d2s, sfc_qty, need_exp, new_exp_date,
         return tmpl.format(**kw)
 
     if seg == "TBD":
-        return {"dest": "No need to Change Zone", "rule": "TBD_KEEP",
+        _tbd_dest = {"en": "Keep in Current Staging Area",
+                     "es": "Mantener en la zona actual de recepción",
+                     "zh": "留在当前待上架区"}.get(lang, "Keep in Current Staging Area")
+        return {"dest": _tbd_dest, "rule": "TBD_KEEP",
                 "reason": _r("TBD_KEEP"), "color": "yellow"}
 
     if seg == "TOP":
@@ -488,7 +492,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: #f5f5f5;
+  background: #fff;
   height: 100dvh;
   display: flex;
   flex-direction: column;
@@ -549,6 +553,7 @@ input[type=text].err    { border-color: #ea4335; background: #fef7f7; }
   overflow-y: auto;
   padding: 10px 14px;
   -webkit-overflow-scrolling: touch;
+  background: #fff;
 }
 
 .info-card {
