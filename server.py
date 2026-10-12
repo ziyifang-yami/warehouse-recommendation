@@ -170,8 +170,8 @@ def query_sku_inventory(sku: str, wh: str = "002") -> dict:
     """
     result = {
         "seg": None, "fc_d2s": None, "sfc_qty": 0.0,
-        "fc_min_exp_date": None, "need_minimal_exp": 0,
-        "avg_daily_orders": 0.0,
+        "fc_min_exp_date": None, "sfc_min_exp_date": None,
+        "need_minimal_exp": 0, "avg_daily_orders": 0.0,
     }
 
     # ── Step 1: segment + avg_daily from SQLite cache ─────────────────────
@@ -179,6 +179,20 @@ def query_sku_inventory(sku: str, wh: str = "002") -> dict:
     result["seg"] = _classify_segment(cache)
     if cache:
         result["avg_daily_orders"] = float(cache.get("avg_daily_orders") or 0)
+
+    # ── Step 1b: need_minimal_exp from im_item_extend (real-time, single SKU) ──
+    try:
+        sql_exp = text("""
+            SELECT need_minimal_exp
+            FROM yamibuy_im.im_item_extend
+            WHERE item_number = :sku
+            LIMIT 1
+        """)
+        with engine.connect() as _c:
+            _df_exp = pd.read_sql(sql_exp, _c, params={"sku": sku})
+        result["need_minimal_exp"] = int(_df_exp.iloc[0]["need_minimal_exp"] or 0) if not _df_exp.empty else 0
+    except Exception:
+        result["need_minimal_exp"] = 0
 
     # ── Step 2: live FC qty, SFC qty, FC oldest expiry from MySQL ─────────
     try:
@@ -191,7 +205,11 @@ def query_sku_inventory(sku: str, wh: str = "002") -> dict:
               MIN(CASE WHEN sl.zone_id != 2 AND sl.location_type IN (3,4)
                             AND COALESCE(sli.expire_dtm, sl.expire_dtm) > 0
                        THEN COALESCE(sli.expire_dtm, sl.expire_dtm)
-                       ELSE NULL END) AS fc_min_exp_dtm
+                       ELSE NULL END) AS fc_min_exp_dtm,
+              MIN(CASE WHEN sl.zone_id = 2  AND sl.location_type IN (3,4)
+                            AND COALESCE(sli.expire_dtm, sl.expire_dtm) > 0
+                       THEN COALESCE(sli.expire_dtm, sl.expire_dtm)
+                       ELSE NULL END) AS sfc_min_exp_dtm
             FROM yamibuy_wh.wh_inventory_transaction inv
             JOIN yamibuy_wh.wh_storage_location sl
               ON inv.location_no=sl.location_no
@@ -213,7 +231,10 @@ def query_sku_inventory(sku: str, wh: str = "002") -> dict:
             min_exp = df_inv.iloc[0]["fc_min_exp_dtm"]
             if min_exp and int(min_exp) > 0:
                 result["fc_min_exp_date"] = date.fromtimestamp(int(min_exp)).isoformat()
-                result["need_minimal_exp"] = 1
+            sfc_min_exp = df_inv.iloc[0]["sfc_min_exp_dtm"]
+            if sfc_min_exp and int(sfc_min_exp) > 0:
+                result["sfc_min_exp_date"] = date.fromtimestamp(int(sfc_min_exp)).isoformat()
+                result["need_minimal_exp"] = 1  # either zone has exp → track expiry
         else:
             fc_qty = 0.0
     except Exception:
@@ -262,6 +283,11 @@ _REASONS = {
         "es": "FC necesita reabastecimiento pero SFC tiene stock ({q} uds) — poner en SFC, esperar T2",
         "zh": "FC 需要补货，但 SFC 有库存（{q} 件）— 先入 SFC，等待 T2 补货",
     },
+    "MID_SFC_EXP_EARLIER_FC": {
+        "en": "New goods expire earlier than SFC stock ({new} ≤ {sfc}) — put in FC first (FEFO)",
+        "es": "Nuevos bienes vencen antes que stock SFC ({new} ≤ {sfc}) — poner en FC primero (FEFO)",
+        "zh": "新货到期日早于 SFC 现有库存（{new} ≤ {sfc}）— 先入 FC（FEFO）",
+    },
     "MID_SFC_EMPTY": {
         "en": "FC needs replenishment and SFC is empty — put directly in FC",
         "es": "FC necesita reabastecimiento y SFC está vacío — poner directamente en FC",
@@ -282,7 +308,7 @@ def _sf(v, d=0.0):
 
 
 def decide_putaway(seg, fc_d2s, sfc_qty, need_exp, new_exp_date,
-                   fc_min_exp_date, cfg, lang="en") -> dict:
+                   fc_min_exp_date, cfg, lang="en", sfc_min_exp_date=None) -> dict:
     putaway_d2s = cfg.get("putaway_d2s", 30)
     fc_d2s  = _sf(fc_d2s)
     sfc_qty = _sf(sfc_qty)
@@ -317,6 +343,14 @@ def decide_putaway(seg, fc_d2s, sfc_qty, need_exp, new_exp_date,
                 "reason": _r("MID_FC_D2S_HIGH", d=f"{fc_d2s:.0f}"), "color": "green"}
 
     if sfc_qty > 0:
+        # Exception: new goods expire earlier/equal to SFC's oldest lot → FC (FEFO)
+        if (new_exp_date is not None
+                and sfc_min_exp_date is not None
+                and new_exp_date <= sfc_min_exp_date):
+            return {"dest": "FC", "rule": "MID_SFC_EXP_EARLIER_FC",
+                    "reason": _r("MID_SFC_EXP_EARLIER_FC",
+                                 new=new_exp_date, sfc=sfc_min_exp_date),
+                    "color": "red"}
         return {"dest": "SFC", "rule": "MID_SFC_HAS_STOCK",
                 "reason": _r("MID_SFC_HAS_STOCK", q=f"{sfc_qty:.0f}"), "color": "green"}
 
@@ -358,6 +392,7 @@ async def scan_id(id: str, lang: str = "en"):
             seg=inv["seg"], fc_d2s=inv["fc_d2s"], sfc_qty=inv["sfc_qty"],
             need_exp=inv["need_minimal_exp"], new_exp_date=exp_date,
             fc_min_exp_date=inv["fc_min_exp_date"], cfg=PUTAWAY_CFG, lang=lang,
+            sfc_min_exp_date=inv["sfc_min_exp_date"],
         ) if inv["seg"] else {
             "dest": "SFC", "rule": "NO_SEG",
             "reason": _REASONS["NO_SEG"].get(lang, _REASONS["NO_SEG"]["en"]),
@@ -487,6 +522,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>Putaway Guide</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏷</text></svg>">
+<link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏷</text></svg>">
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
 
@@ -752,7 +789,9 @@ function showResult(d) {
   const dest   = rec.dest  || "SFC";
   const rule   = rec.rule  || "";
   const reason = rec.reason|| "";
-  const arrow  = color === "green" ? "🟢" : color === "yellow" ? "🟡" : "🔴";
+  const arrow  = color === "green"  ? `<span style="display:inline-block;width:1.2rem;height:1.2rem;border-radius:50%;background:#34a853;vertical-align:middle;margin-right:6px"></span>`
+               : color === "yellow" ? `<span style="display:inline-block;width:1.2rem;height:1.2rem;border-radius:50%;background:#f0a500;vertical-align:middle;margin-right:6px"></span>`
+               : `<span style="display:inline-block;width:1.2rem;height:1.2rem;border-radius:50%;background:#ea4335;vertical-align:middle;margin-right:6px"></span>`;
   // For yellow (TBD), show dest directly without "PUT AWAY TO" prefix
   const bannerText = color === "yellow" ? dest : `${S.rec} ${dest}`;
   const d2s    = d.fc_d2s != null ? d.fc_d2s + "d" : "—";
