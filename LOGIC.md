@@ -1,151 +1,176 @@
-# LOC Recommendation — Putaway Logic
+# Putaway Guide — Decision Logic
 
-## Overview
-
-This tool helps warehouse associates decide whether a newly received inbound batch should be put away to **NJFC (Zone 1)** or **SFC (Zone 2)**, based on expiry date comparison with existing inventory.
-
-Scope: **Warehouse 002 only.**
+**App:** `http://zbot-agent.yamibuy.net:8504`  
+**Scope:** Warehouse 002 (NJ FC + SFC)  
+**Updated:** 2026-10-14
 
 ---
 
-## User Flow
+## Overview
 
-```
-Step 1 — Scan Batch Number (BT barcode)
-            ↓
-Step 2 — Scan UPC or type SKU
-            ↓
-    System looks up batch record + product info
-            ↓
-    System queries Zone 1 current inventory expiry
-            ↓
-    Displays putaway recommendation: TO NJFC or TO SFC
-```
+When a receiving associate scans a BT or GT barcode, the system:
+1. Resolves the SKU automatically from the batch record
+2. Looks up the SKU's **sales segment** and **live inventory state**
+3. Applies the putaway decision tree
+4. Displays a color-coded recommendation: **FC**, **SFC**, or **Keep in Current Staging Area**
 
 ---
 
 ## Zone Definitions
 
-| Zone | Facility | zone_id | Description |
-|------|----------|---------|-------------|
-| Zone 1 | **NJFC** | 1 | Primary pick zone — should always hold the freshest stock |
-| Zone 2 | **SFC** | 2+ | Secondary storage — holds older or overflow stock |
-
-The goal is FIFO by expiry: **NJFC should never hold stock that expires later than what's in SFC.** Fresher product goes into Zone 1 to ensure it gets picked first.
+| Zone | Facility | Description |
+|------|----------|-------------|
+| **FC** | NJ Fulfillment Center | Primary pick zone — high-velocity, always replenished |
+| **SFC** | Secondary FC | Overflow/backup storage — feeds FC via T1/T2 transfers |
+| **Staging Area** | Receiving | New product staging — hold until classified |
 
 ---
 
-## Decision Logic
+## Step 1 — Scan Input
 
-### Inputs
+Scan either:
+- **BT barcode** (`BT{rec_Id}`) — matches `wh_inbound_batch.rec_Id`
+- **GT barcode** (`GT…`) — matches `wh_inbound_batch.group_batch_id`
 
-| Input | Source | Field |
+Both automatically resolve to: SKU, quantity, expiry date, received time, receiver.
+
+---
+
+## Step 2 — Segment Classification
+
+The SKU's **sales segment** is determined from the NJ Allocation cache (`sfc_cache.db`):
+
+| Segment | Criteria |
+|---------|----------|
+| **TBD** | `inv_days_30 < 30` OR `inv_days_30 = NaN` (new product, in stock < 30 days) |
+| **TOP** | `active_order_days ≥ 21` AND `order_lines_30d ≥ 30` |
+| **TAIL** | `order_lines_30d < 8` |
+| **MIDDLE** | All others |
+
+`need_minimal_exp` (expiry tracking flag) is read in real-time from `yamibuy_im.im_item_extend`.
+
+---
+
+## Step 3 — Putaway Decision Tree
+
+### TBD — New Product
+
+```
+→ Keep in Current Staging Area  (TBD_KEEP)
+Reason: Product has been in stock < 30 days — hold at receiving zone
+        until classified by the next Allocation cycle.
+```
+
+---
+
+### TOP — High Velocity
+
+```
+→ FC  (TOP_FC)
+Reason: TOP SKUs always live in FC for fast replenishment.
+```
+
+---
+
+### TAIL — Low Velocity
+
+```
+→ SFC  (TAIL_SFC)
+Reason: TAIL SKUs always live in SFC — transferred to FC only when needed.
+```
+
+---
+
+### MIDDLE — Moderate Velocity
+
+Decision is made in this order:
+
+```
+Step 1 — FEFO check vs FC:
+  need_minimal_exp = 1
+  AND new_exp < fc_min_exp_date (FC's oldest lot expiry)
+  → FC  (MID_EXP_EARLIER_FC)
+  Reason: New goods expire earlier than FC stock — put in FC first (FEFO)
+
+Step 2 — FC has enough stock:
+  FC D2S > 30 days
+  → SFC  (MID_FC_D2S_HIGH)
+  Reason: FC already has sufficient stock (>30 days) — put new goods in SFC
+
+Step 3 — FC needs replenishment, SFC has stock:
+  FC D2S ≤ 30 AND sfc_qty > 0
+  ├─ Sub-check: need_minimal_exp = 1 AND new_exp ≤ sfc_min_exp_date
+  │    → FC  (MID_SFC_EXP_EARLIER_FC)
+  │    Reason: New goods expire earlier/same as SFC's oldest lot
+  │            — put in FC first (FEFO vs SFC)
+  └─ Otherwise:
+       → SFC  (MID_SFC_HAS_STOCK)
+       Reason: SFC has stock — put new goods in SFC, wait for T2 to replenish FC
+
+Step 4 — FC needs replenishment, SFC is empty:
+  FC D2S ≤ 30 AND sfc_qty = 0
+  → FC  (MID_SFC_EMPTY)
+  Reason: Both FC and SFC are low — put directly in FC
+```
+
+---
+
+## Decision Summary Table
+
+| Segment | Condition | → Zone | Rule |
+|---------|-----------|--------|------|
+| TBD | Any | Keep in Staging | TBD_KEEP |
+| TOP | Any | FC | TOP_FC |
+| TAIL | Any | SFC | TAIL_SFC |
+| MIDDLE | `need_exp=1` AND `new_exp < fc_min_exp` | FC | MID_EXP_EARLIER_FC |
+| MIDDLE | `fc_d2s > 30` | SFC | MID_FC_D2S_HIGH |
+| MIDDLE | `fc_d2s ≤ 30`, `sfc>0`, `need_exp=1`, `new_exp ≤ sfc_min_exp` | FC | MID_SFC_EXP_EARLIER_FC |
+| MIDDLE | `fc_d2s ≤ 30`, `sfc>0` | SFC | MID_SFC_HAS_STOCK |
+| MIDDLE | `fc_d2s ≤ 30`, `sfc=0` | FC | MID_SFC_EMPTY |
+| Any | No segment data | SFC | NO_SEG (fallback) |
+
+---
+
+## Data Sources
+
+| Field | Source | Notes |
 |-------|--------|-------|
-| Incoming batch expiry | `wh_inbound_batch.qc_ExpiredDate` | Unix timestamp → `DATE` |
-| Zone 1 worst expiry | `wh_storage_location_item.expire_dtm` (SKU-level, preferred) or `wh_storage_location.expire_dtm` (location-level fallback) | Unix timestamp → `DATE` |
-
-### Decision Tree
-
-```
-Has incoming batch an expiry date?
-├── NO  → ⚠️ Cannot determine zone (show warning, no recommendation)
-└── YES → Query Zone 1 current inventory for worst (earliest) expiry date
-          │
-          ├── Zone 1 has NO stock (or no expiry data)
-          │     → Route to SFC (Zone 2)
-          │       Reason: no existing stock to compare against
-          │
-          ├── Zone 1 worst_exp < incoming_exp
-          │   (Zone 1 stock expires EARLIER than this batch)
-          │     → Route to NJFC (Zone 1)  ✅
-          │       Reason: Zone 1 holds older stock; this fresher batch should
-          │               fill Zone 1 so it gets picked before the older stock
-          │
-          └── Zone 1 worst_exp >= incoming_exp
-              (Zone 1 stock expires SAME or LATER than this batch)
-                → Route to SFC (Zone 2)
-                  Reason: Zone 1 already has fresher or equivalent stock;
-                          this batch is older/equal and should go to SFC
-```
-
-### Summary Table
-
-| Zone 1 state | Decision | Banner |
-|---|---|---|
-| No stock in Zone 1 | **TO SFC** | 🟢 Green |
-| Zone 1 expires **before** this batch | **TO NJFC** | 🔴 Red |
-| Zone 1 expires **same day or after** this batch | **TO SFC** | 🟢 Green |
-| No expiry on incoming batch | ⚠️ No recommendation | — |
+| SKU, qty, expiry, receiver | `wh_inbound_batch` | Via BT (rec_Id) or GT (group_batch_id) |
+| Product name | `im_item` → `xysc_goods` | EN name for EN/ES; ZH name for ZH |
+| Segment (TOP/MIDDLE/TAIL/TBD) | `sfc_cache.db → sales + tbd_skus` | Refreshed every 12h by Allocation cron |
+| `avg_daily_orders` | `sfc_cache.db → sales` | Used to compute FC D2S |
+| `need_minimal_exp` | `yamibuy_im.im_item_extend` (real-time) | 1 = expiry-tracked product |
+| FC qty, SFC qty | `wh_inventory_transaction` (real-time) | zone_id != 2 → FC; zone_id = 2 → SFC |
+| FC min expiry | `wh_storage_location_item` / `wh_storage_location` (real-time) | MIN exp across FC lots |
+| SFC min expiry | `wh_storage_location_item` / `wh_storage_location` (real-time) | MIN exp across SFC lots |
+| FC D2S | `fc_qty / avg_daily_orders` | Computed on the fly |
 
 ---
 
-## Zone 1 Expiry Query
+## Thresholds (configurable)
 
-The system reads Zone 1 expiry from two tables with a priority order:
-
-1. **`wh_storage_location_item`** (SKU-level) — checked first. Stores expiry per SKU per location. This is the most accurate source.
-2. **`wh_storage_location`** (location-level) — fallback when no SKU-level record exists.
-
-Filter conditions:
-- `warehouse_number = '002'`
-- `zone_id = 1`
-- `location_type IN (3, 4)` — STOCK and BIN Pick locations only (excludes staging, receiving, etc.)
-- `quantity > 0` — only locations with live inventory
-- `expire_dtm > 0` — only locations with a known expiry date
-
-The query returns `MIN(expire_dtm)` — the **earliest** (worst) expiry across all qualifying Zone 1 locations for that SKU.
-
-```sql
-SELECT MIN(
-    IF(sli.rec_id IS NULL, sl.expire_dtm, sli.expire_dtm)
-) AS zone1_worst_exp_dtm
-FROM wh_inventory_transaction inv
-JOIN wh_storage_location sl
-    ON inv.location_no = sl.location_no AND inv.warehouse_number = sl.warehouse_number
-LEFT JOIN wh_storage_location_item sli
-    ON sl.location_no = sli.location_no AND sl.warehouse_number = sli.warehouse_number
-    AND sli.item_number = inv.item_number
-WHERE inv.warehouse_number = '002'
-  AND inv.item_number = :sku
-  AND inv.quantity > 0
-  AND sl.zone_id = 1
-  AND sl.location_type IN (3, 4)
-  AND IF(sli.rec_id IS NULL, sl.expire_dtm, sli.expire_dtm) > 0
-```
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `putaway_d2s` | 30 days | MIDDLE: FC D2S above this → SFC |
+| `_TBD_DAYS` | 30 days | TBD: inv_days_30 below this → TBD |
+| `_SEG_AOD_TOP` | 21 days | TOP: active order days threshold |
+| `_SEG_OL_TOP` | 30 lines | TOP: order lines (30d) threshold |
+| `_SEG_OL_TAIL` | 8 lines | TAIL: order lines (30d) below this |
 
 ---
 
-## Batch Expiry Source
+## Color Coding
 
-Incoming batch expiry is read from `wh_inbound_batch.qc_ExpiredDate` (Unix timestamp), matched by `rec_Id = CAST(SUBSTRING(:bt_number, 3) AS UNSIGNED)` (stripping the `BT` prefix) and `item_number`.
-
----
-
-## Visual Output
-
-| Result | Background | Border | Label |
-|--------|-----------|--------|-------|
-| TO SFC | `#d4edda` (light green) | `#28a745` | **TO SFC** |
-| TO NJFC | `#f8d7da` (light red) | `#dc3545` | **TO NJFC** |
-
-Both banners display a sub-line explaining the reason (Zone 1 expiry vs incoming batch expiry).
+| Color | Zone | Meaning |
+|-------|------|---------|
+| 🔴 Red | FC | Put in Fulfillment Center |
+| 🟢 Green | SFC | Put in Secondary FC |
+| 🟡 Yellow | Staging | Keep in Current Staging Area (TBD) |
 
 ---
 
-## Error / Edge Cases
+## Languages
 
-| Condition | Behaviour |
-|-----------|-----------|
-| `qc_ExpiredDate = 0` or NULL on incoming batch | Warning: "No expiry date on this batch — cannot determine putaway zone." |
-| No Zone 1 inventory (or all locations have `expire_dtm = 0`) | Route to SFC |
-| DB connection unavailable | Warning displayed; no recommendation shown |
-| SKU not found in item master | Error: "UPC not in item master" |
-| BT number not matching any batch for that SKU | Error: "No record for this BT + SKU" |
-
----
-
-## Limitations & Future Improvements
-
-- Currently supports **WH 002 only**. Logic can be extended to other warehouses by parameterising `zone_id` mapping per warehouse.
-- Only considers **expiry date** for the putaway decision. Future versions could incorporate velocity (pick frequency), space availability per zone, or temperature zone requirements.
-- The `location_type IN (3, 4)` filter covers STOCK and BIN Pick. If zone layout changes, this filter may need updating.
+The UI supports **EN / ES / ZH** (select via top-right dropdown, persisted in localStorage).  
+In ZH mode, product names display in Chinese (`goods_name`).  
+All putaway reasons are translated server-side based on the `lang` parameter.
